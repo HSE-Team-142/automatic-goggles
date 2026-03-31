@@ -1,2 +1,14 @@
 **/Binoculars/Binoculars/
 **/M4GT-Bench/
+train_bert.py
+**/mdeberta-v3-base-fine-tune-m4gt/
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
