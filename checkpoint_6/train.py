@@ -119,7 +119,7 @@ def train(
         weight_decay=weight_decay,
     )
 
-    best_f1 = -math.inf
+    best_roc_auc = -math.inf
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
             model=model,
@@ -137,14 +137,17 @@ def train(
             f"train_loss={train_loss:.4f} "
             f"eval_loss={metrics['loss']:.4f} "
             f"accuracy={metrics['accuracy']:.4f} "
-            f"macro_f1={metrics['macro_f1']:.4f} "
-            f"precision={metrics['precision']:.4f} "
-            f"recall={metrics['recall']:.4f} "
+            f"human_f1={metrics['human_f1']:.4f} "
+            f"human_precision={metrics['human_precision']:.4f} "
+            f"human_recall={metrics['human_recall']:.4f} "
+            f"ai_f1={metrics['ai_f1']:.4f} "
+            f"ai_precision={metrics['ai_precision']:.4f} "
+            f"ai_recall={metrics['ai_recall']:.4f} "
             f"roc_auc={metrics['roc_auc']:.4f}"
         )
 
-        if metrics["macro_f1"] > best_f1:
-            best_f1 = metrics["macro_f1"]
+        if metrics["roc_auc"] > best_roc_auc:
+            best_roc_auc = metrics["roc_auc"]
             checkpoint_path = output_dir / "pawn_best.pt"
             torch.save(
                 {
@@ -203,9 +206,12 @@ def evaluate(
     model.eval()
     criterion = nn.BCEWithLogitsLoss()
     accuracy_metric = BinaryAccuracy().to(device)
-    macro_f1_metric = BinaryF1Score().to(device)
-    precision_metric = BinaryPrecision().to(device)
-    recall_metric = BinaryRecall().to(device)
+    human_f1_metric = BinaryF1Score().to(device)
+    human_precision_metric = BinaryPrecision().to(device)
+    human_recall_metric = BinaryRecall().to(device)
+    ai_f1_metric = BinaryF1Score().to(device)
+    ai_precision_metric = BinaryPrecision().to(device)
+    ai_recall_metric = BinaryRecall().to(device)
     roc_auc_metric = BinaryAUROC().to(device)
 
     total_loss = 0.0
@@ -217,13 +223,16 @@ def evaluate(
         labels = batch["labels"].to(device)
         logits = model(texts).squeeze(-1)
         loss = criterion(logits, labels)
-        targets = labels.long()
+        labels = labels.long()
 
-        accuracy_metric.update(logits, targets)
-        macro_f1_metric.update(logits, targets)
-        precision_metric.update(logits, targets)
-        recall_metric.update(logits, targets)
-        roc_auc_metric.update(logits, targets)
+        accuracy_metric.update(logits, labels)
+        human_f1_metric.update(logits, labels)
+        human_precision_metric.update(logits, labels)
+        human_recall_metric.update(logits, labels)
+        ai_f1_metric.update(-logits, 1 - labels)
+        ai_precision_metric.update(-logits, 1 - labels)
+        ai_recall_metric.update(-logits, 1 - labels)
+        roc_auc_metric.update(logits, labels)
 
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
@@ -233,9 +242,12 @@ def evaluate(
     return {
         "loss": total_loss / max(total_examples, 1),
         "accuracy": float(accuracy_metric.compute().item()),
-        "macro_f1": float(macro_f1_metric.compute().item()),
-        "precision": float(precision_metric.compute().item()),
-        "recall": float(recall_metric.compute().item()),
+        "human_f1": float(human_f1_metric.compute().item()),
+        "human_precision": float(human_precision_metric.compute().item()),
+        "human_recall": float(human_recall_metric.compute().item()),
+        "ai_f1": float(ai_f1_metric.compute().item()),
+        "ai_precision": float(ai_precision_metric.compute().item()),
+        "ai_recall": float(ai_recall_metric.compute().item()),
         "roc_auc": float(roc_auc_metric.compute().item()),
     }
 
