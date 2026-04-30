@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import random
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ from torchmetrics.classification import (
 )
 from tqdm.auto import tqdm
 
-from checkpoint_6.dataset_module import TextDataset, collate_text_batch
+from dataset_module import TextDataset, collate_text_batch
 from model import PAWN, PAWNConfig
 
 
@@ -42,7 +42,7 @@ def main() -> None:
         collate_fn=collate_text_batch,
     )
     eval_loader = DataLoader(
-        TextDataset(args.validation_dataset),
+        TextDataset(args.valid_dataset),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -260,44 +260,16 @@ def set_seed(seed: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", default=None, help="Path to a YAML file with training parameters.")
-    config_args, _ = config_parser.parse_known_args()
-
     parser = argparse.ArgumentParser(description="Train checkpoint_6 PAWN on text/label CSV datasets.")
-    parser.add_argument("--config", default=None, help="Path to a YAML file with training parameters.")
-    dataset_paths_required = config_args.config is None
-    parser.add_argument("--train_dataset", type=str, required=dataset_paths_required, help="Path to train CSV.")
-    parser.add_argument("--validation_dataset", type=str, required=dataset_paths_required, help="Path to validation CSV.")
-    parser.add_argument("--test_dataset", type=str, required=dataset_paths_required, help="Path to test CSV.")
-    parser.add_argument("--model_name", default="openai-community/gpt2", help="Frozen causal LM backbone.")
-    parser.add_argument("--output_dir", default=os.path.join("checkpoint_6", "outputs"))
-    parser.add_argument("--device", default=None, help="Device override, for example cuda, mps, or cpu.")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--metric_features", type=int, default=256)
-    parser.add_argument("--gates", type=int, default=256)
-    parser.add_argument("--mlp_hidden_features", type=int, default=256)
-    parser.add_argument("--mlp_hidden_layers", type=int, default=3)
-    parser.add_argument("--mlp_dropout", type=float, default=0.0)
-    parser.add_argument("--token_dropout", type=float, default=0.15)
+    parser.add_argument("--config", type=str, required=True, help="Path to a YAML file with training parameters.")
+    parser.add_argument("--train_dataset", type=str, required=True, help="Path to train CSV.")
+    parser.add_argument("--valid_dataset", type=str, required=True, help="Path to validation CSV.")
+    parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
 
-    if config_args.config is not None:
-        yaml_config = load_yaml_config(config_args.config)
-        valid_keys = {action.dest for action in parser._actions}
-        unknown_keys = sorted(set(yaml_config) - valid_keys)
-        if unknown_keys:
-            parser.error(f"unknown YAML config keys: {unknown_keys}")
-        parser.set_defaults(**yaml_config)
-
-    return parser.parse_args()
+    args = parser.parse_args()
+    config = load_yaml_config(args.config)
+    config.update(vars(args))
+    return SimpleNamespace(**config)
 
 
 def load_yaml_config(path: str) -> dict:
