@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
-from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -82,9 +80,12 @@ def main() -> None:
         "test "
         f"loss={test_metrics['loss']:.4f} "
         f"accuracy={test_metrics['accuracy']:.4f} "
-        f"macro_f1={test_metrics['macro_f1']:.4f} "
-        f"precision={test_metrics['precision']:.4f} "
-        f"recall={test_metrics['recall']:.4f} "
+        f"human_f1={test_metrics['human_f1']:.4f} "
+        f"human_precision={test_metrics['human_precision']:.4f} "
+        f"human_recall={test_metrics['human_recall']:.4f} "
+        f"ai_f1={test_metrics['ai_f1']:.4f} "
+        f"ai_precision={test_metrics['ai_precision']:.4f} "
+        f"ai_recall={test_metrics['ai_recall']:.4f} "
         f"roc_auc={test_metrics['roc_auc']:.4f}"
     )
 
@@ -92,7 +93,7 @@ def main() -> None:
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "config": asdict(config),
+            "config": config.model_dump(),
             "args": vars(args),
             "test_metrics": test_metrics,
         },
@@ -281,7 +282,7 @@ def parse_args() -> argparse.Namespace:
     except ValueError as exc:
         parser.error(str(exc))
     args.config = config
-    return SimpleNamespace(**config)
+    return args
 
 
 def load_yaml_config(path: str) -> ExperimentConfig:
