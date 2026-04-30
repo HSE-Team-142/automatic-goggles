@@ -6,6 +6,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 from torch import nn
@@ -36,7 +37,7 @@ def main() -> None:
 
     device_name = trainer_config.device or default_device()
     device = torch.device(device_name)
-    output_dir = Path(trainer_config.output_dir)
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader = DataLoader(
@@ -76,6 +77,8 @@ def main() -> None:
     )
 
     test_metrics = evaluate(model, test_loader, device)
+    test_metrics_path = output_dir / "test_metrics.csv"
+    write_metrics_csv(test_metrics_path, [prefix_metrics("test", test_metrics)])
     print(
         "test "
         f"loss={test_metrics['loss']:.4f} "
@@ -94,11 +97,16 @@ def main() -> None:
         {
             "model_state_dict": model.state_dict(),
             "config": config.model_dump(),
-            "args": vars(args),
+            "datasets": {
+                "train": args.train_dataset,
+                "valid": args.valid_dataset,
+                "test": args.test_dataset,
+            },
             "test_metrics": test_metrics,
         },
         final_path,
     )
+    print(f"saved test metrics to {test_metrics_path}")
     print(f"saved final checkpoint to {final_path}")
 
 
@@ -121,6 +129,9 @@ def train(
     )
 
     best_roc_auc = -math.inf
+    epoch_metrics_path = output_dir / "epoch_metrics.csv"
+    epoch_metrics_rows = []
+
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
             model=model,
@@ -133,6 +144,15 @@ def train(
             epochs=epochs,
         )
         metrics = evaluate(model, eval_loader, device, desc=f"eval epoch {epoch}/{epochs}")
+        epoch_metrics_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                **prefix_metrics("valid", metrics),
+            }
+        )
+        write_metrics_csv(epoch_metrics_path, epoch_metrics_rows)
+
         print(
             f"epoch={epoch} "
             f"train_loss={train_loss:.4f} "
@@ -160,6 +180,8 @@ def train(
                 checkpoint_path,
             )
             print(f"saved best checkpoint to {checkpoint_path}")
+
+    print(f"saved epoch metrics to {epoch_metrics_path}")
 
 
 def train_one_epoch(
@@ -253,6 +275,17 @@ def evaluate(
     }
 
 
+def prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}_{name}": value for name, value in metrics.items()}
+
+
+def write_metrics_csv(path: Path, rows: list[dict[str, float]]) -> None:
+    if not rows:
+        return
+
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -275,6 +308,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_dataset", type=str, required=True, help="Path to train CSV.")
     parser.add_argument("--valid_dataset", type=str, required=True, help="Path to validation CSV.")
     parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Optional output directory override. Defaults to trainer.output_dir from the YAML config.",
+    )
 
     args = parser.parse_args()
     try:

@@ -34,7 +34,6 @@ class OptimizerConfig(StrictConfig):
 
 
 class TrainerConfig(StrictConfig):
-    output_dir: str = "checkpoint_6/outputs"
     device: str | None = None
     seed: int = 42
     epochs: int = 5

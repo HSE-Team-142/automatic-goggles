@@ -15,7 +15,6 @@ optimizer:
   grad_clip: 1.0
 
 trainer:
-  output_dir: checkpoint_6/outputs/mage_gpt2
   device: null
   seed: 42
   epochs: 5
