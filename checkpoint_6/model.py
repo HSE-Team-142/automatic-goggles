@@ -1,30 +1,14 @@
 import torch
 from torch import nn
 
-from dataclasses import dataclass
-
 from frozen_pretrained_model import FronzenPretrainedModel
 from mlp import MLP
+from configs import ModelConfig
 
 from transformers import AutoConfig
 
-@dataclass
-class PAWNConfig:
-    max_length: int = 512
-    metric_features: int = 256
-    gates: int = 256
-    mlp_hidden_features: int = 256
-    mlp_hidden_layers: int = 3
-    mlp_dropout: float = 0.0
-    token_dropout: float = 0.15
-    model_name: str = "openai-community/gpt2"
-
-    def __post_init__(self) -> None:
-        if self.metric_features % self.gates != 0:
-            raise ValueError("metric_features must be divisible by gates")
-
 class PAWN(nn.Module):
-    def __init__(self, config: PAWNConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
 
@@ -39,6 +23,7 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
         self.gate_nn = MLP(
             input_dim=gate_nn_input_dim,
@@ -46,6 +31,7 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
         self.aggregate_nn = MLP(
             input_dim=config.metric_features,
@@ -53,6 +39,7 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
     
     def forward(self, texts: list[str]) -> torch.Tensor:

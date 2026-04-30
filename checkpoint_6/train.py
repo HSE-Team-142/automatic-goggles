@@ -21,61 +21,58 @@ from torchmetrics.classification import (
 )
 from tqdm.auto import tqdm
 
+from configs import ExperimentConfig, build_experiment_config
 from dataset_module import TextDataset, collate_text_batch
-from model import PAWN, PAWNConfig
+from model import PAWN
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    config = args.config
+    model_config = config.model
+    optimizer_config = config.optimizer
+    trainer_config = config.trainer
+    data_config = config.data
 
-    device = torch.device(args.device if args.device else default_device())
-    output_dir = Path(args.output_dir)
+    set_seed(trainer_config.seed)
+
+    device_name = trainer_config.device or default_device()
+    device = torch.device(device_name)
+    output_dir = Path(trainer_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
 
     train_loader = DataLoader(
         TextDataset(args.train_dataset),
-        batch_size=args.batch_size,
+        batch_size=data_config.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=data_config.num_workers,
         collate_fn=collate_text_batch,
     )
     eval_loader = DataLoader(
         TextDataset(args.valid_dataset),
-        batch_size=args.eval_batch_size,
+        batch_size=data_config.eval_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=data_config.num_workers,
         collate_fn=collate_text_batch,
     )
     test_loader = DataLoader(
         TextDataset(args.test_dataset),
-        batch_size=args.eval_batch_size,
+        batch_size=data_config.eval_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=data_config.num_workers,
         collate_fn=collate_text_batch,
     )
 
-    config = PAWNConfig(
-        max_length=args.max_length,
-        metric_features=args.metric_features,
-        gates=args.gates,
-        mlp_hidden_features=args.mlp_hidden_features,
-        mlp_hidden_layers=args.mlp_hidden_layers,
-        mlp_dropout=args.mlp_dropout,
-        token_dropout=args.token_dropout,
-        model_name=args.model_name,
-    )
-    model = PAWN(config).to(device)
+    model = PAWN(model_config).to(device)
 
     train(
         model=model,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        grad_clip=args.grad_clip,
+        epochs=trainer_config.epochs,
+        learning_rate=optimizer_config.learning_rate,
+        weight_decay=optimizer_config.weight_decay,
+        grad_clip=optimizer_config.grad_clip,
         device=device,
         output_dir=output_dir,
     )
@@ -267,29 +264,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
 
     args = parser.parse_args()
-    config = load_yaml_config(args.config)
-    config.update(vars(args))
+    try:
+        config = load_yaml_config(args.config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.config = config
     return SimpleNamespace(**config)
 
 
-def load_yaml_config(path: str) -> dict:
+def load_yaml_config(path: str) -> ExperimentConfig:
     with open(path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file) or {}
+        raw_config = yaml.safe_load(file) or {}
 
-    if not isinstance(config, dict):
+    if not isinstance(raw_config, dict):
         raise ValueError(f"YAML config must contain a mapping at the top level: {path}")
 
-    return flatten_config(config)
-
-
-def flatten_config(config: dict) -> dict:
-    values = {}
-    for key, value in config.items():
-        if isinstance(value, dict):
-            values.update(flatten_config(value))
-        else:
-            values[key] = value
-    return values
+    return build_experiment_config(raw_config)
 
 
 if __name__ == "__main__":
