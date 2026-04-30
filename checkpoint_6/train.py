@@ -21,7 +21,7 @@ from torchmetrics.classification import (
 )
 from tqdm.auto import tqdm
 
-from loag_dataset import TextDataset, collate_text_batch, load_mage_dataset
+from checkpoint_6.dataset_module import TextDataset, collate_text_batch
 from model import PAWN, PAWNConfig
 
 
@@ -33,30 +33,23 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    datasets = load_mage_dataset(
-        dataset_name=args.dataset_name,
-        train_samples=args.train_samples,
-        eval_samples=args.eval_samples,
-        test_samples=args.test_samples,
-        seed=args.seed,
-    )
 
     train_loader = DataLoader(
-        TextDataset(datasets["train"]),
+        TextDataset(args.train_dataset),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_text_batch,
     )
     eval_loader = DataLoader(
-        TextDataset(datasets["validation"]),
+        TextDataset(args.validation_dataset),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_text_batch,
     )
     test_loader = DataLoader(
-        TextDataset(datasets["test"]),
+        TextDataset(args.test_dataset),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -271,9 +264,12 @@ def parse_args() -> argparse.Namespace:
     config_parser.add_argument("--config", default=None, help="Path to a YAML file with training parameters.")
     config_args, _ = config_parser.parse_known_args()
 
-    parser = argparse.ArgumentParser(description="Train checkpoint_6 PAWN on yaful/MAGE.")
+    parser = argparse.ArgumentParser(description="Train checkpoint_6 PAWN on text/label CSV datasets.")
     parser.add_argument("--config", default=None, help="Path to a YAML file with training parameters.")
-    parser.add_argument("--dataset_name", default="yaful/MAGE", help="Hugging Face dataset name.")
+    dataset_paths_required = config_args.config is None
+    parser.add_argument("--train_dataset", type=str, required=dataset_paths_required, help="Path to train CSV.")
+    parser.add_argument("--validation_dataset", type=str, required=dataset_paths_required, help="Path to validation CSV.")
+    parser.add_argument("--test_dataset", type=str, required=dataset_paths_required, help="Path to test CSV.")
     parser.add_argument("--model_name", default="openai-community/gpt2", help="Frozen causal LM backbone.")
     parser.add_argument("--output_dir", default=os.path.join("checkpoint_6", "outputs"))
     parser.add_argument("--device", default=None, help="Device override, for example cuda, mps, or cpu.")
@@ -292,9 +288,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp_hidden_layers", type=int, default=3)
     parser.add_argument("--mlp_dropout", type=float, default=0.0)
     parser.add_argument("--token_dropout", type=float, default=0.15)
-    parser.add_argument("--train_samples", type=int, default=None, help="Optional train subset size.")
-    parser.add_argument("--eval_samples", type=int, default=None, help="Optional validation subset size.")
-    parser.add_argument("--test_samples", type=int, default=None, help="Optional test subset size.")
 
     if config_args.config is not None:
         yaml_config = load_yaml_config(config_args.config)
