@@ -1,10 +1,9 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
 import numpy as np
-
-from scipy.stats import skew, kurtosis, entropy as calc_entropy
-from scipy.fftpack import fft, ifft
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -12,15 +11,16 @@ class FronzenPretrainedModel(nn.Module):
     def __init__(
         self,
         model_name: str,
-        max_length: int = 512
+        max_length: int = 512,
+        hf_token: Optional[str] = None,
     ):
         super().__init__()
 
         self.model_name = model_name
         self.max_length = max_length
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
         if tokenizer.pad_token is None:
             if tokenizer.eos_token is None:
@@ -66,40 +66,4 @@ class FronzenPretrainedModel(nn.Module):
         rank = mask.float().mean(dim=-1)
         top_p = (probs * mask).sum(dim=-1)
 
-        # surprisals = -next_token_log_probs
-
-        # s = surprisals.numpy()
-        # mean_s, std_s, var_s, skew_s, kurt_s = np.mean(s), np.std(s), np.var(s), skew(s), kurtosis(s)
-        # diff_s = np.diff(s)
-        # mean_diff, std_diff = np.mean(diff_s), np.std(diff_s)
-        # first_order_diff = np.diff(next_token_log_probs)
-        # second_order_diff = np.diff(first_order_diff)
-        # var_2nd, entropy_2nd = np.var(second_order_diff), calc_entropy(np.histogram(second_order_diff, bins=20, density=True)[0])
-        # autocorr_2nd = np.corrcoef(second_order_diff[:-1], second_order_diff[1:])[0, 1] if len(second_order_diff) > 1 else 0
-
-        # N = next_token_log_probs.shape[-1]
-        # fft_log_probs = fft(next_token_log_probs.numpy())
-        # power_half = (((np.abs(fft_log_probs))/N) ** 2)[:,:(int(N/2))]
-        # energy = np.sum(power_half, axis=1)
-
-        return torch.stack([next_token_log_probs, entropy, max_log_probs, rank, top_p], dim=-1)
-
-        # return [
-        #     next_token_log_probs,
-        #     entropy, 
-        #     max_log_probs,
-        #     rank,
-        #     top_p,
-        #     mean_s,
-        #     std_s,
-        #     var_s,
-        #     skew_s,
-        #     kurt_s,
-        #     mean_diff,
-        #     std_diff,
-        #     var_2nd,
-        #     entropy_2nd,
-        #     autocorr_2nd,
-        #     energy,
-        # ]
-    
+        return torch.stack([entropy, max_log_probs, next_token_log_probs, rank, top_p], dim=-1)

@@ -1,292 +1,78 @@
-from __future__ import annotations
-
+import os
+import torch 
 import argparse
-import math
-import random
-from pathlib import Path
+import json
+import yaml
 
 import numpy as np
-import pandas as pd
-import torch
-import yaml
-from torch import nn
-from torch.utils.data import DataLoader
-from torchmetrics.classification import (
-    BinaryAccuracy,
-    BinaryAUROC,
-    BinaryF1Score,
-    BinaryPrecision,
-    BinaryRecall,
-)
-from tqdm.auto import tqdm
+from pathlib import Path
 
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 from configs import ExperimentConfig, build_experiment_config
+
 from dataset_module import TextDataset, collate_text_batch
 from model import PAWN
 
 
-def main() -> None:
-    args = parse_args()
-    config = args.config
-    model_config = config.model
-    optimizer_config = config.optimizer
-    trainer_config = config.trainer
-    data_config = config.data
+class PAWNTrainer(Trainer):
+    def __init__(
+        self,
+        *args,
+        label_smoothing: float = 0.0,
+        pos_weight: float = 1.0,
+        train_sampler=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.label_smoothing = float(label_smoothing)
+        self._pos_weight = float(pos_weight)
+        self._train_sampler = train_sampler
 
-    set_seed(trainer_config.seed)
+    def _get_train_sampler(self, train_dataset=None):
+        if self._train_sampler is not None:
+            return self._train_sampler
+        return super()._get_train_sampler(train_dataset)
 
-    device_name = trainer_config.device or default_device()
-    device = torch.device(device_name)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        labels = inputs.pop("labels")
+        logits = model(**inputs)
 
-    train_loader = DataLoader(
-        TextDataset(args.train_dataset),
-        batch_size=data_config.batch_size,
-        shuffle=True,
-        num_workers=data_config.num_workers,
-        collate_fn=collate_text_batch,
-    )
-    eval_loader = DataLoader(
-        TextDataset(args.valid_dataset),
-        batch_size=data_config.eval_batch_size,
-        shuffle=False,
-        num_workers=data_config.num_workers,
-        collate_fn=collate_text_batch,
-    )
-    test_loader = DataLoader(
-        TextDataset(args.test_dataset),
-        batch_size=data_config.eval_batch_size,
-        shuffle=False,
-        num_workers=data_config.num_workers,
-        collate_fn=collate_text_batch,
-    )
+        smoothed = labels.float() * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+        pos_weight = torch.tensor(self._pos_weight, device=logits.device, dtype=logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, smoothed, pos_weight=pos_weight)
 
-    model = PAWN(model_config).to(device)
-
-    train(
-        model=model,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        epochs=trainer_config.epochs,
-        learning_rate=optimizer_config.learning_rate,
-        weight_decay=optimizer_config.weight_decay,
-        grad_clip=optimizer_config.grad_clip,
-        device=device,
-        output_dir=output_dir,
-    )
-
-    test_metrics = evaluate(model, test_loader, device)
-    test_metrics_path = output_dir / "test_metrics.csv"
-    write_metrics_csv(test_metrics_path, [prefix_metrics("test", test_metrics)])
-    print(
-        "test "
-        f"loss={test_metrics['loss']:.4f} "
-        f"accuracy={test_metrics['accuracy']:.4f} "
-        f"human_f1={test_metrics['human_f1']:.4f} "
-        f"human_precision={test_metrics['human_precision']:.4f} "
-        f"human_recall={test_metrics['human_recall']:.4f} "
-        f"ai_f1={test_metrics['ai_f1']:.4f} "
-        f"ai_precision={test_metrics['ai_precision']:.4f} "
-        f"ai_recall={test_metrics['ai_recall']:.4f} "
-        f"roc_auc={test_metrics['roc_auc']:.4f}"
-    )
-
-    final_path = output_dir / "pawn_final.pt"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": config.model_dump(),
-            "datasets": {
-                "train": args.train_dataset,
-                "valid": args.valid_dataset,
-                "test": args.test_dataset,
-            },
-            "test_metrics": test_metrics,
-        },
-        final_path,
-    )
-    print(f"saved test metrics to {test_metrics_path}")
-    print(f"saved final checkpoint to {final_path}")
+        if return_outputs:
+          return (loss, logits)
+        return loss
 
 
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    eval_loader: DataLoader,
-    epochs: int,
-    learning_rate: float,
-    weight_decay: float,
-    grad_clip: float | None,
-    device: torch.device,
-    output_dir: Path,
-) -> None:
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
+def compute_metrics(eval_pred):
+      logits = np.asarray(eval_pred.predictions).reshape(-1)
+      labels = np.asarray(eval_pred.label_ids).reshape(-1).astype(int)
 
-    best_roc_auc = -math.inf
-    epoch_metrics_path = output_dir / "epoch_metrics.csv"
-    epoch_metrics_rows = []
+      preds = (logits >= 0).astype(int)
 
-    for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            grad_clip=grad_clip,
-            device=device,
-            epoch=epoch,
-            epochs=epochs,
-        )
-        metrics = evaluate(model, eval_loader, device, desc=f"eval epoch {epoch}/{epochs}")
-        epoch_metrics_rows.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                **prefix_metrics("valid", metrics),
-            }
-        )
-        write_metrics_csv(epoch_metrics_path, epoch_metrics_rows)
+      return {
+          "accuracy": accuracy_score(labels, preds),
 
-        print(
-            f"epoch={epoch} "
-            f"train_loss={train_loss:.4f} "
-            f"eval_loss={metrics['loss']:.4f} "
-            f"accuracy={metrics['accuracy']:.4f} "
-            f"human_f1={metrics['human_f1']:.4f} "
-            f"human_precision={metrics['human_precision']:.4f} "
-            f"human_recall={metrics['human_recall']:.4f} "
-            f"ai_f1={metrics['ai_f1']:.4f} "
-            f"ai_precision={metrics['ai_precision']:.4f} "
-            f"ai_recall={metrics['ai_recall']:.4f} "
-            f"roc_auc={metrics['roc_auc']:.4f}"
-        )
+          "human_f1": f1_score(labels, preds, zero_division=0),
+          "human_precision": precision_score(labels, preds, zero_division=0),
+          "human_recall": recall_score(labels, preds, zero_division=0),
 
-        if metrics["roc_auc"] > best_roc_auc:
-            best_roc_auc = metrics["roc_auc"]
-            checkpoint_path = output_dir / "pawn_best.pt"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "eval_metrics": metrics,
-                },
-                checkpoint_path,
-            )
-            print(f"saved best checkpoint to {checkpoint_path}")
+          "ai_f1": f1_score(1 - labels, 1 - preds, zero_division=0),
+          "ai_precision": precision_score(1 - labels, 1 - preds, zero_division=0),
+          "ai_recall": recall_score(1 - labels, 1 - preds, zero_division=0),
 
-    print(f"saved epoch metrics to {epoch_metrics_path}")
+          "roc_auc": roc_auc_score(labels, logits),
+          "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
+      }
 
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    grad_clip: float | None,
-    device: torch.device,
-    epoch: int,
-    epochs: int,
-) -> float:
-    model.train()
-    total_loss = 0.0
-    total_examples = 0
-
-    progress = tqdm(loader, desc=f"train epoch {epoch}/{epochs}", leave=False)
-    for batch in progress:
-        texts = batch["texts"]
-        labels = batch["labels"].to(device)
-        logits = model(texts).squeeze(-1)
-        loss = criterion(logits, labels)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip is not None:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-
-        batch_size = labels.size(0)
-        total_loss += loss.item() * batch_size
-        total_examples += batch_size
-        progress.set_postfix(loss=total_loss / max(total_examples, 1))
-
-    return total_loss / max(total_examples, 1)
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    desc: str = "eval",
-) -> dict[str, float]:
-    model.eval()
-    criterion = nn.BCEWithLogitsLoss()
-    accuracy_metric = BinaryAccuracy().to(device)
-    human_f1_metric = BinaryF1Score().to(device)
-    human_precision_metric = BinaryPrecision().to(device)
-    human_recall_metric = BinaryRecall().to(device)
-    ai_f1_metric = BinaryF1Score().to(device)
-    ai_precision_metric = BinaryPrecision().to(device)
-    ai_recall_metric = BinaryRecall().to(device)
-    roc_auc_metric = BinaryAUROC().to(device)
-
-    total_loss = 0.0
-    total_examples = 0
-
-    progress = tqdm(loader, desc=desc, leave=False)
-    for batch in progress:
-        texts = batch["texts"]
-        labels = batch["labels"].to(device)
-        logits = model(texts).squeeze(-1)
-        loss = criterion(logits, labels)
-        labels = labels.long()
-
-        accuracy_metric.update(logits, labels)
-        human_f1_metric.update(logits, labels)
-        human_precision_metric.update(logits, labels)
-        human_recall_metric.update(logits, labels)
-        ai_f1_metric.update(-logits, 1 - labels)
-        ai_precision_metric.update(-logits, 1 - labels)
-        ai_recall_metric.update(-logits, 1 - labels)
-        roc_auc_metric.update(logits, labels)
-
-        batch_size = labels.size(0)
-        total_loss += loss.item() * batch_size
-        total_examples += batch_size
-        progress.set_postfix(loss=total_loss / max(total_examples, 1))
-
-    return {
-        "loss": total_loss / max(total_examples, 1),
-        "accuracy": float(accuracy_metric.compute().item()),
-        "human_f1": float(human_f1_metric.compute().item()),
-        "human_precision": float(human_precision_metric.compute().item()),
-        "human_recall": float(human_recall_metric.compute().item()),
-        "ai_f1": float(ai_f1_metric.compute().item()),
-        "ai_precision": float(ai_precision_metric.compute().item()),
-        "ai_recall": float(ai_recall_metric.compute().item()),
-        "roc_auc": float(roc_auc_metric.compute().item()),
-    }
-
-
-def prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
-    return {f"{prefix}_{name}": value for name, value in metrics.items()}
-
-
-def write_metrics_csv(path: Path, rows: list[dict[str, float]]) -> None:
-    if not rows:
-        return
-
-    pd.DataFrame(rows).to_csv(path, index=False)
-
-
-def default_device() -> str:
+def _default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -294,16 +80,58 @@ def default_device() -> str:
     return "cpu"
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def _get_training_args(args):
+    config = args.config
+    optimizer_config = config.optimizer
+    trainer_config = config.trainer
+    data_config = config.data
+
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        
+        # Training hyperparameters
+        num_train_epochs=trainer_config.epochs,
+        per_device_train_batch_size=data_config.batch_size,
+        per_device_eval_batch_size=data_config.eval_batch_size,
+
+        # Optimizer settings
+        learning_rate=optimizer_config.learning_rate,
+        weight_decay=optimizer_config.weight_decay,
+
+        # Training Stability
+        max_grad_norm=optimizer_config.max_grad_norm,
+        gradient_accumulation_steps=optimizer_config.gradient_accumulation_steps,
+
+        # Scheduler
+        lr_scheduler_type="cosine",
+        warmup_steps=0,
+
+        # Evaluation and logging
+        eval_strategy="epoch",
+        logging_strategy="steps",
+        logging_steps=100,
+        logging_dir=os.path.join(args.output_dir, "tensorboard"),
+
+        # Saving strategy
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        save_total_limit=2,
+
+        # Metric
+        metric_for_best_model="roc_auc",
+        greater_is_better=True,
+
+        # Other
+        seed=trainer_config.seed,
+        report_to="tensorboard",
+    )
+
+    return training_args
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train checkpoint_6 PAWN on text/label CSV datasets.")
+    parser = argparse.ArgumentParser(description="Train PAWN.")
     parser.add_argument("--config", type=str, required=True, help="Path to a YAML file with training parameters.")
     parser.add_argument("--train_dataset", type=str, required=True, help="Path to train CSV.")
     parser.add_argument("--valid_dataset", type=str, required=True, help="Path to validation CSV.")
@@ -332,6 +160,46 @@ def load_yaml_config(path: str) -> ExperimentConfig:
         raise ValueError(f"YAML config must contain a mapping at the top level: {path}")
 
     return build_experiment_config(raw_config)
+
+
+def main() -> None:
+    args = parse_args()
+    config = args.config
+    model_config = config.model
+    optimizer_config = config.optimizer
+
+    device = _default_device()
+
+    train_dataset = TextDataset(args.train_dataset)
+
+    eval_dataset = TextDataset(args.valid_dataset)
+
+    test_dataset = TextDataset(args.test_dataset)
+
+    model = PAWN(model_config).to(device)
+
+    training_args = _get_training_args(args)
+
+    trainer = PAWNTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collate_text_batch,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(
+            early_stopping_patience=5,
+        )],
+        label_smoothing=optimizer_config.label_smoothing,
+        pos_weight=optimizer_config.pos_weight,
+    )
+
+    trainer.train()
+
+    prediction_output = trainer.predict(test_dataset)
+
+    with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
+        json.dump(prediction_output.metrics, f, indent=2)
 
 
 if __name__ == "__main__":

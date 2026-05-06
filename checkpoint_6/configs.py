@@ -2,14 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, model_validator
 
 
-class StrictConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class ModelConfig(StrictConfig):
+class ModelConfig(BaseModel):
     model_name: str = "openai-community/gpt2"
     max_length: int = 512
     metric_features: int = 256
@@ -27,25 +23,28 @@ class ModelConfig(StrictConfig):
         return self
 
 
-class OptimizerConfig(StrictConfig):
+class OptimizerConfig(BaseModel):
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    grad_clip: float | None = 1.0
+    max_grad_norm: float | None = 1.0
+    gradient_accumulation_steps: int | None = 1
+    label_smoothing: float = 0.2
+    pos_weight: float = 0.413
 
 
-class TrainerConfig(StrictConfig):
+class TrainerConfig(BaseModel):
     device: str | None = None
     seed: int = 42
     epochs: int = 5
 
 
-class DataConfig(StrictConfig):
+class DataConfig(BaseModel):
     batch_size: int = 4
     eval_batch_size: int = 4
     num_workers: int = 0
 
 
-class ExperimentConfig(StrictConfig):
+class ExperimentConfig(BaseModel):
     model: ModelConfig
     optimizer: OptimizerConfig
     trainer: TrainerConfig

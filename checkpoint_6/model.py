@@ -1,21 +1,31 @@
 import torch
 from torch import nn
+import os
 
 from frozen_pretrained_model import FronzenPretrainedModel
 from mlp import MLP
 from configs import ModelConfig
 
+from dotenv import dotenv_values
 from transformers import AutoConfig
+
+
+try:
+    ENV_CONFIG = dotenv_values(".env")
+    HF_TOKEN = ENV_CONFIG.get("HF_TOKEN")
+except:
+    HF_TOKEN = None
+
 
 class PAWN(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.config = config
+        self.pawn_config = config
 
-        pretrained_model_hidden_dim = AutoConfig.from_pretrained(config.model_name).hidden_size
+        pretrained_model_hidden_dim = AutoConfig.from_pretrained(config.model_name, token=HF_TOKEN).hidden_size
         gate_nn_input_dim = pretrained_model_hidden_dim * 2 + 1
 
-        self.frozen_pretrained_model = FronzenPretrainedModel(config.model_name, self.config.max_length)
+        self.frozen_pretrained_model = FronzenPretrainedModel(config.model_name, config.max_length, hf_token=HF_TOKEN)
 
         self.metrics_nn = MLP(
             input_dim=5,
@@ -23,7 +33,6 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
-            residual=config.residual,
         )
         self.gate_nn = MLP(
             input_dim=gate_nn_input_dim,
@@ -31,7 +40,6 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
-            residual=config.residual,
         )
         self.aggregate_nn = MLP(
             input_dim=config.metric_features,
@@ -39,7 +47,6 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
-            residual=config.residual,
         )
     
     def forward(self, texts: list[str]) -> torch.Tensor:
@@ -48,21 +55,22 @@ class PAWN(nn.Module):
 
         current_hs = hidden_states[:, :-1, :]
         next_hs =  hidden_states[:, 1:, :]
-        pos_embeddings = self._pos_embeddings(L-1, B, hidden_states.device, self.config.max_length)
+        pos_embeddings = self._pos_embeddings(L-1, B, hidden_states.device, self.pawn_config.max_length)
         gate_inputs = torch.cat([current_hs, next_hs, pos_embeddings], dim=-1)
-        gate_mask = self._gate_mask(attention_mask[:, 1:] == 0)
+        attention_mask = attention_mask[:, :-1]
+        gate_mask = self._gate_mask(attention_mask == 0)
         gate_logits = self.gate_nn(gate_inputs)
         gate_logits = gate_logits.masked_fill(gate_mask.unsqueeze(-1), float("-inf"))
 
-        weights = torch.softmax(gate_logits, dim=-2)
-        weights = weights.repeat_interleave(self.config.metric_features // self.config.gates, dim=-1)
-
         metrics_features = self.metrics_nn(metrics)
+        G, M = gate_logits.size(-1), metrics_features.size(-1)
+        if 1 < G < M:
+            gate_logits = gate_logits.repeat(1, 1, M // G)
 
-        aggregate = (weights * metrics_features).sum(dim=1)
-        output = self.aggregate_nn(aggregate)
+        aggregated_input = (gate_logits.softmax(dim=-2) * metrics_features).sum(dim=-2)
+        aggregated_output = self.aggregate_nn(aggregated_input)
 
-        return output.squeeze(-1)
+        return aggregated_output.squeeze(-1)
 
     def _pos_embeddings(self, length: int, batch_size: int, device: torch.device, max_length: int) -> torch.Tensor:
         pos_embeddings = torch.arange(length, device=device, dtype=torch.float32)
@@ -70,13 +78,16 @@ class PAWN(nn.Module):
         return (pos_embeddings / max_length).unsqueeze(-1)
     
     def _gate_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.pawn_config.token_dropout == 0:
+            return mask
+
         B, L = mask.size()
         device = mask.device
 
-        dropout_mask = (torch.rand(B, L, device=device) < self.config.token_dropout)
+        dropout_mask = (torch.rand(B, L, device=device) < self.pawn_config.token_dropout)
         final_mask = dropout_mask | mask
         while final_mask.all(dim=-1).any().item() is True:
-            dropout_mask = (torch.rand(B, L, device=device) < self.config.token_dropout)
+            dropout_mask = (torch.rand(B, L, device=device) < self.pawn_config.token_dropout)
             final_mask = dropout_mask | mask
         
         return final_mask
