@@ -41,7 +41,6 @@ class TrainerConfig(BaseModel):
 class DataConfig(BaseModel):
     batch_size: int = 4
     eval_batch_size: int = 4
-    num_workers: int = 0
 
 
 class ExperimentConfig(BaseModel):

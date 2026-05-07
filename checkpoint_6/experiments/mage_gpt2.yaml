@@ -10,8 +10,9 @@ model:
   residual: true
 
 optimizer:
-  learning_rate: 1e-3
-  weight_decay: 1e-2
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-2
+  max_grad_norm: 1.0
   gradient_accumulation_steps: 1.0
   label_smoothing: 0.2
   pos_weight: 0.413
@@ -24,4 +25,3 @@ trainer:
 data:
   batch_size: 16
   eval_batch_size: 16
-  num_workers: 0
