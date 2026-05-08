@@ -28,12 +28,6 @@ class PAWNTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.label_smoothing = float(label_smoothing)
         self._pos_weight = float(pos_weight)
-        self._train_sampler = train_sampler
-
-    def _get_train_sampler(self, train_dataset=None):
-        if self._train_sampler is not None:
-            return self._train_sampler
-        return super()._get_train_sampler(train_dataset)
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -136,12 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_dataset", type=str, required=True, help="Path to train CSV.")
     parser.add_argument("--valid_dataset", type=str, required=True, help="Path to validation CSV.")
     parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="output",
-        help="Optional output directory override. Defaults to trainer.output_dir from the YAML config.",
-    )
+    parser.add_argument("--output_dir", type=str, default="output", help="Output directory override. Defaults to trainer.output_dir from the YAML config.",)
 
     args = parser.parse_args()
     try:

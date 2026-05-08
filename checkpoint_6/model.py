@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import os
 
-from frozen_pretrained_model import FronzenPretrainedModel
+from extract_features import FeatureExtractor
 from mlp import MLP
 from configs import ModelConfig
 
@@ -22,17 +22,37 @@ class PAWN(nn.Module):
         super().__init__()
         self.pawn_config = config
 
-        pretrained_model_hidden_dim = AutoConfig.from_pretrained(config.model_name, token=HF_TOKEN).hidden_size
-        gate_nn_input_dim = pretrained_model_hidden_dim * 2 + 1
+        pretrained_model_hidden_dim = AutoConfig.from_pretrained(config.primary_model_name, token=HF_TOKEN).hidden_size
 
-        self.frozen_pretrained_model = FronzenPretrainedModel(config.model_name, config.max_length, hf_token=HF_TOKEN)
+        if config.return_second_model_hs:
+            gate_nn_input_dim = pretrained_model_hidden_dim * 4 + 1
+        else:
+            gate_nn_input_dim = pretrained_model_hidden_dim * 2 + 1
+
+        metrics_nn_input_dim = len(config.primary_model_metrics)
+        if config.second_model_metrics is not None:
+            metrics_nn_input_dim += len(config.second_model_metrics)
+        if config.return_xppl:
+            metrics_nn_input_dim += 1
+
+        self.feature_extractor = FeatureExtractor(
+            primary_model_name=config.primary_model_name, 
+            primary_model_metrics=config.primary_model_metrics,
+            max_length=config.max_length, 
+            second_model_name=config.second_model_name,
+            second_model_metrics=config.second_model_metrics,
+            return_xppl=config.return_xppl,
+            return_second_model_hs=config.return_second_model_hs,
+            hf_token=HF_TOKEN,
+        )
 
         self.metrics_nn = MLP(
-            input_dim=5,
+            input_dim=metrics_nn_input_dim,
             output_dim=config.metric_features,
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
         self.gate_nn = MLP(
             input_dim=gate_nn_input_dim,
@@ -40,6 +60,7 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
         self.aggregate_nn = MLP(
             input_dim=config.metric_features,
@@ -47,16 +68,28 @@ class PAWN(nn.Module):
             hidden_dim=config.mlp_hidden_features,
             hidden_layers=config.mlp_hidden_layers,
             dropout=config.mlp_dropout,
+            residual=config.residual,
         )
     
     def forward(self, texts: list[str]) -> torch.Tensor:
-        metrics, hidden_states, attention_mask = self.frozen_pretrained_model(texts)
-        B, L, _ = hidden_states.size()
+        features = self.feature_extractor(texts)
+        metrics = features["metrics"]
+        primary_hidden_states = features["primary_hidden_states"]
+        second_hidden_states = features["second_hidden_states"]
+        attention_mask = features["attention_mask"]
+        B, L, _ = primary_hidden_states.size()
 
-        current_hs = hidden_states[:, :-1, :]
-        next_hs =  hidden_states[:, 1:, :]
-        pos_embeddings = self._pos_embeddings(L-1, B, hidden_states.device, self.pawn_config.max_length)
-        gate_inputs = torch.cat([current_hs, next_hs, pos_embeddings], dim=-1)
+        primary_current_hs = primary_hidden_states[:, :-1, :] # [B, L-1, H]
+        primary_next_hs =  primary_hidden_states[:, 1:, :] # [B, L-1, H]
+        pos_embeddings = self._pos_embeddings(L-1, B, primary_current_hs.device, self.pawn_config.max_length) # [B, L-1, 1]
+
+        if second_hidden_states is not None:
+            second_current_hs = second_hidden_states[:, :-1, :] # [B, L-1, H]
+            second_next_hs =  second_hidden_states[:, 1:, :] # [B, L-1, H]
+            gate_inputs = torch.cat([primary_current_hs, primary_next_hs, second_current_hs, second_next_hs, pos_embeddings], dim=-1) # [B, L-1, 4H + 1]
+        else:
+            gate_inputs = torch.cat([primary_current_hs, primary_next_hs, pos_embeddings], dim=-1) # [B, L-1, 2H + 1]
+        
         attention_mask = attention_mask[:, :-1]
         gate_mask = self._gate_mask(attention_mask == 0)
         gate_logits = self.gate_nn(gate_inputs)

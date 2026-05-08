@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, model_validator
 
 
 class ModelConfig(BaseModel):
-    model_name: str = "openai-community/gpt2"
+    primary_model_name: str = "openai-community/gpt2"
     max_length: int = 512
     metric_features: int = 256
     gates: int = 256
@@ -15,6 +15,11 @@ class ModelConfig(BaseModel):
     mlp_dropout: float = 0.0
     token_dropout: float = 0.15
     residual: bool = True
+    primary_model_metrics: Optional[list[str]] = ["entropy", "max_log_probs", "next_token_log_probs", "rank", "top_p"]
+    second_model_name: Optional[str] = None
+    second_model_metrics: Optional[list[str]] = None
+    return_xppl: Optional[bool] = False
+    return_second_model_hs: Optional[bool] = False
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> ModelConfig:
@@ -26,14 +31,14 @@ class ModelConfig(BaseModel):
 class OptimizerConfig(BaseModel):
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    max_grad_norm: float | None = 1.0
-    gradient_accumulation_steps: int | None = 1
-    label_smoothing: float = 0.2
-    pos_weight: float = 0.413
+    max_grad_norm: Optional[float] = 1.0
+    gradient_accumulation_steps: Optional[int] = 1
+    label_smoothing: Optional[float]= 0.0
+    pos_weight: Optional[float] = 1.0
 
 
 class TrainerConfig(BaseModel):
-    device: str | None = None
+    device: Optional[str] = None
     seed: int = 42
     epochs: int = 5
 
