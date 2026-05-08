@@ -71,7 +71,7 @@ class PAWN(nn.Module):
             residual=config.residual,
         )
     
-    def forward(self, texts: list[str]) -> torch.Tensor:
+    def forward(self, texts: list[str], labels: torch.Tensor | None = None) -> torch.Tensor:
         features = self.feature_extractor(texts)
         metrics = features["metrics"]
         primary_hidden_states = features["primary_hidden_states"]

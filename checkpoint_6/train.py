@@ -22,7 +22,6 @@ class PAWNTrainer(Trainer):
         *args,
         label_smoothing: float = 0.0,
         pos_weight: float = 1.0,
-        train_sampler=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -40,8 +39,16 @@ class PAWNTrainer(Trainer):
         loss = F.binary_cross_entropy_with_logits(logits, smoothed, pos_weight=pos_weight)
 
         if return_outputs:
-          return (loss, logits)
+          return (loss, {"logits": logits})
         return loss
+
+    def _save(self, output_dir=None, state_dict=None):
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
 
 def compute_metrics(eval_pred):

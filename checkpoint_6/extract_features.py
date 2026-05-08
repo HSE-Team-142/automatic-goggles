@@ -8,10 +8,10 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def assert_tokenizer_consistency(model_name_1, model_name_2):
+def assert_tokenizer_consistency(model_name_1, model_name_2, hf_token=None):
     identical_tokenizers = (
-            AutoTokenizer.from_pretrained(model_name_1).vocab
-            == AutoTokenizer.from_pretrained(model_name_2).vocab
+            AutoTokenizer.from_pretrained(model_name_1, token=hf_token).vocab
+            == AutoTokenizer.from_pretrained(model_name_2, token=hf_token).vocab
     )
     if not identical_tokenizers:
         raise ValueError(f"Tokenizers are not identical for {model_name_1} and {model_name_2}.")
@@ -54,7 +54,7 @@ class FeatureExtractor(nn.Module):
         self.return_second_model_hs = return_second_model_hs
         self.second_model = None
         if second_model_name is not None:
-            assert_tokenizer_consistency(primary_model_name, second_model_name)
+            assert_tokenizer_consistency(primary_model_name, second_model_name, hf_token=hf_token)
             self.second_model = AutoModelForCausalLM.from_pretrained(second_model_name, token=hf_token)
             self.second_model.config.pad_token_id = tokenizer.pad_token_id
             self.second_model.eval()
