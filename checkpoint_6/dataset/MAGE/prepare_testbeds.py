@@ -76,6 +76,15 @@ model_sets = [
 
 data_dir = sys.argv[1]
 dataset = load_dataset("yaful/MAGE")
+
+def replace_labels(example):
+    if example["label"] == 1:
+        example["label"] = 0
+    else:
+        example["label"] = 1
+    return example
+
+dataset = dataset.map(replace_labels)
 if not os.path.exists(data_dir):
     os.makedirs(data_dir)
 """
@@ -103,7 +112,9 @@ merge_dict = {
 
 
 test_ood_gpt = load_dataset("yaful/MAGE", data_files="test_ood_set_gpt.csv", split="train")
+test_ood_gpt = test_ood_gpt.map(replace_labels)
 test_ood_gpt_para = load_dataset("yaful/MAGE", data_files="test_ood_set_gpt_para.csv", split="train")
+test_ood_gpt_para = test_ood_gpt_para.map(replace_labels)
 test_ood_gpt.to_csv(os.path.join(data_dir, "test_ood_gpt.csv"))
 test_ood_gpt_para.to_csv(os.path.join(data_dir, "test_ood_gpt_para.csv"))
 
@@ -124,11 +135,11 @@ def prepare_domain_specific_model_specific():
                 res = res[:2]
                 if name in info:
                     # human-written
-                    if res[1] == "1" and count <= split_count:
+                    if res[1] == "0" and count <= split_count:
                         sub_results[name][split].append(res)
                     # machine-generated
                     if tgt_model in info:
-                        assert res[1] == "0"
+                        assert res[1] == "1"
                         sub_results[name][split].append(res)
                     count += 1
 
@@ -160,7 +171,7 @@ def prepare_domain_specific_cross_models():
                 res = res[:2]
                 if name in info:
                     # human-written
-                    if res[1] == "1":
+                    if res[1] == "0":
                         sub_results[name][split].append(res)
                     # machine-generated
                     else:
@@ -189,7 +200,6 @@ def prepare_cross_domains_model_specific():
         _tmp = " ".join(model_patterns)
         print(f"## preparing {_tmp} ...")
 
-        ood_pos_test_samples = []
         out_split_samples = defaultdict(list)
         for split in ["train", "valid", "test"]:
             rows = merge_dict[split][0]
@@ -199,7 +209,7 @@ def prepare_cross_domains_model_specific():
             for row in rows:
                 valid = False
                 srcinfo = row[2]
-                if row[1] == "1":  # appending all positive samples
+                if row[1] == "0":  # appending all human samples
                     valid = True
                 for pattern in model_patterns:
                     if pattern in srcinfo:
@@ -214,11 +224,11 @@ def prepare_cross_domains_model_specific():
         for split in ["train", "valid", "test"]:
             random.seed(1)
             rows = out_split_samples[split]
-            pos_rows = [r for r in rows if r[1] == "1"]
-            neg_rows = [r for r in rows if r[1] == "0"]
-            len_neg = len(neg_rows)
-            random.shuffle(pos_rows)
-            out_split_samples[split] = pos_rows[:len_neg] + neg_rows
+            human_rows = [r for r in rows if r[1] == "0"]
+            ai_rows = [r for r in rows if r[1] == "1"]
+            len_ai = len(ai_rows)
+            random.shuffle(human_rows)
+            out_split_samples[split] = human_rows[:len_ai] + ai_rows
 
         for split in ["train", "valid", "test"]:
             out_rows = [e[:-1] for e in out_split_samples[split]]
@@ -254,7 +264,6 @@ def prepare_unseen_models():
         _tmp = " ".join(model_patterns)
         print(f"## preparing ood-models {_tmp} ...")
 
-        ood_pos_test_samples = []
         out_split_samples = defaultdict(list)
         for split in ["train", "valid", "test", "test_ood"]:
             data_name = split if split != "test_ood" else "test"
@@ -281,14 +290,12 @@ def prepare_unseen_models():
 
         random.seed(1)
         test_rows = out_split_samples["test"]
-        test_pos_rows = [r for r in test_rows if r[1] == "1"]
-        test_neg_rows = [r for r in test_rows if r[1] == "0"]
+        test_human_rows = [r for r in test_rows if r[1] == "0"]
         len_aug = len(out_split_samples["test_ood"])
         # print(len_aug)
-        random.shuffle(test_pos_rows)
-        # out_split_samples['test'] = test_pos_rows[len_aug:] + test_neg_rows
+        random.shuffle(test_human_rows)
         out_split_samples["test_ood"] = (
-            test_pos_rows[:len_aug] + out_split_samples["test_ood"]
+            test_human_rows[:len_aug] + out_split_samples["test_ood"]
         )
 
         for split in ["train", "valid", "test", "test_ood"]:
@@ -314,7 +321,6 @@ def prepare_unseen_domains():
 
         print(f"## preparing ood-domains {name} ...")
 
-        ood_pos_test_samples = []
         out_split_samples = defaultdict(list)
         for split in ["train", "valid", "test", "test_ood"]:
             data_name = split if split != "test_ood" else "test"
