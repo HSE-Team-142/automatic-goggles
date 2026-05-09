@@ -1,0 +1,15 @@
+{
+  "test_loss": 0.4016551971435547,
+  "test_accuracy": 0.8368207036201702,
+  "test_human_f1": 0.8383825207891733,
+  "test_human_precision": 0.8275873169161436,
+  "test_human_recall": 0.8494630761605815,
+  "test_ai_f1": 0.8352284061440255,
+  "test_ai_precision": 0.8464856122380214,
+  "test_ai_recall": 0.8242666841656276,
+  "test_roc_auc": 0.9155947441843175,
+  "test_f1_macro": 0.8368054634665993,
+  "test_runtime": 1259.847,
+  "test_samples_per_second": 48.215,
+  "test_steps_per_second": 1.507
+}
