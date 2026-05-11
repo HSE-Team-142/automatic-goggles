@@ -1,1 +1,1 @@
-# automatic-goggles
+# Чекпоинт 6
