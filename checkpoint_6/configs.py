@@ -20,6 +20,7 @@ class ModelConfig(BaseModel):
     second_model_name: Optional[str] = None
     second_model_metrics: Optional[list[str]] = None
     second_model_agg_metrics: Optional[list[str]] = None
+    cross_model_agg_features: Optional[list[str]] = None
     return_xppl: Optional[bool] = False
     return_second_model_hs: Optional[bool] = False
 
@@ -31,6 +32,8 @@ class ModelConfig(BaseModel):
             raise ValueError("second_model_name must be set when second_model_metrics is used")
         if self.second_model_agg_metrics and self.second_model_name is None:
             raise ValueError("second_model_name must be set when second_model_agg_metrics is used")
+        if self.cross_model_agg_features and self.second_model_name is None:
+            raise ValueError("second_model_name must be set when cross_model_agg_features is used")
         return self
 
 

@@ -27,6 +27,7 @@ class FeatureExtractor(nn.Module):
         second_model_name: Optional[str] = None,
         second_model_metrics: Optional[list[str]] = None,
         second_model_agg_metrics: Optional[list[str]] = None,
+        cross_model_agg_features: Optional[list[str]] = None,
         return_xppl: Optional[bool] = False,
         return_second_model_hs: Optional[bool] = False,
         hf_token: Optional[str] = None,
@@ -54,6 +55,7 @@ class FeatureExtractor(nn.Module):
 
         self.second_model_metrics = second_model_metrics or []
         self.second_model_agg_metrics = second_model_agg_metrics or []
+        self.cross_model_agg_features = cross_model_agg_features or []
         self.return_xppl = return_xppl
         self.return_second_model_hs = return_second_model_hs
         self.second_model = None
@@ -109,6 +111,14 @@ class FeatureExtractor(nn.Module):
                     self.second_model_agg_metrics,
                 )
                 agg_metrics.append(second_model_agg_metrics)
+            if self.cross_model_agg_features:
+                cross_model_agg_features = self._get_cross_model_agg_features(
+                    primary_model_logits,
+                    second_model_logits,
+                    encoded_text["input_ids"],
+                    self.cross_model_agg_features,
+                )
+                agg_metrics.append(cross_model_agg_features)
             if self.return_xppl:
                 xppl = self._get_xppl(primary_model_logits, second_model_logits)
                 metrics.append(xppl)
@@ -258,5 +268,50 @@ class FeatureExtractor(nn.Module):
             else:
                 autocorr_2nd = torch.zeros(B, device=log_likelihoods_diff_2nd.device)
                 metrics.append(autocorr_2nd)
+
+        return torch.stack(metrics, dim=-1) # [B, M]
+    
+    def _get_cross_model_agg_features(
+            self,
+            logits_model_1: torch.Tensor,
+            logits_model_2: torch.Tensor,
+            input_ids: torch.Tensor,
+            metrics_list: list[str],
+        ) -> torch.Tensor:
+        eps = torch.finfo(logits_model_1.float().dtype).eps
+        shift_logits_model_1 = logits_model_1[:, :-1, :]
+        shift_input_ids = input_ids[:, 1:]
+        log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
+        log_likelihoods_model_1 = log_probs_model_1.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
+        surprisals_model_1 = -log_likelihoods_model_1
+
+        shift_logits_model_2 = logits_model_2[:, :-1, :]
+        log_probs_model_2 = torch.log_softmax(shift_logits_model_2.float(), dim=-1)
+        log_likelihoods_model_2 = log_probs_model_2.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
+        surprisals_model_2 = -log_likelihoods_model_2
+
+        metrics = []
+
+        mean_model_1 = surprisals_model_1.mean(dim=1, keepdim=True)
+        mean_model_2 = surprisals_model_2.mean(dim=1, keepdim=True)
+
+        diff_model_1 = surprisals_model_1 - mean_model_1
+        diff_model_2 = surprisals_model_2 - mean_model_2
+
+        if "cov" in metrics_list:
+            cov = (diff_model_1 * diff_model_2).mean(dim=1)
+            metrics.append(cov)
+
+        if "corr" in metrics_list:
+            var_model_1 = diff_model_1.pow(2).sum(dim=1)
+            var_model_2 = diff_model_2.pow(2).sum(dim=1)
+            numerator = (diff_model_1 * diff_model_2).sum(dim=1)
+            denominator = torch.sqrt(var_model_1 * var_model_2)
+            corr = numerator / denominator.clamp_min(eps)
+            metrics.append(corr)
+
+        if "cos_sim" in metrics_list:
+            cos_sim = torch.cosine_similarity(surprisals_model_1, surprisals_model_2, dim=1, eps=eps)
+            metrics.append(cos_sim)
 
         return torch.stack(metrics, dim=-1) # [B, M]

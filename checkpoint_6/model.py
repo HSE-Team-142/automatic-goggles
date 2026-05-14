@@ -38,6 +38,8 @@ class PAWN(nn.Module):
         agg_metrics_dim = len(config.primary_model_agg_metrics or [])
         if config.second_model_agg_metrics is not None:
             agg_metrics_dim += len(config.second_model_agg_metrics)
+        if config.cross_model_agg_features is not None:
+            agg_metrics_dim += len(config.cross_model_agg_features)
 
         self.feature_extractor = FeatureExtractor(
             primary_model_name=config.primary_model_name, 
@@ -47,6 +49,7 @@ class PAWN(nn.Module):
             second_model_name=config.second_model_name,
             second_model_metrics=config.second_model_metrics,
             second_model_agg_metrics=config.second_model_agg_metrics,
+            cross_model_agg_features=config.cross_model_agg_features,
             return_xppl=config.return_xppl,
             return_second_model_hs=config.return_second_model_hs,
             hf_token=HF_TOKEN,
