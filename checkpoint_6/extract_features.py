@@ -22,9 +22,11 @@ class FeatureExtractor(nn.Module):
         self,
         primary_model_name: str,
         primary_model_metrics: list[str],
+        primary_model_agg_metrics: Optional[list[str]] = None,
         max_length: int = 512,
         second_model_name: Optional[str] = None,
         second_model_metrics: Optional[list[str]] = None,
+        second_model_agg_metrics: Optional[list[str]] = None,
         return_xppl: Optional[bool] = False,
         return_second_model_hs: Optional[bool] = False,
         hf_token: Optional[str] = None,
@@ -33,6 +35,7 @@ class FeatureExtractor(nn.Module):
 
         self.max_length = max_length
         self.primary_model_metrics = primary_model_metrics
+        self.primary_model_agg_metrics = primary_model_agg_metrics or []
 
         self.primary_model = AutoModelForCausalLM.from_pretrained(primary_model_name, token=hf_token)
         tokenizer = AutoTokenizer.from_pretrained(primary_model_name, token=hf_token)
@@ -50,6 +53,7 @@ class FeatureExtractor(nn.Module):
         self.tokenizer = tokenizer
 
         self.second_model_metrics = second_model_metrics or []
+        self.second_model_agg_metrics = second_model_agg_metrics or []
         self.return_xppl = return_xppl
         self.return_second_model_hs = return_second_model_hs
         self.second_model = None
@@ -79,6 +83,14 @@ class FeatureExtractor(nn.Module):
         primary_model_metrics = self._get_model_metrics(primary_model_logits, encoded_text["input_ids"], self.primary_model_metrics)
 
         metrics = [primary_model_metrics]
+        agg_metrics = []
+        if self.primary_model_agg_metrics:
+            primary_model_agg_metrics = self._get_model_agg_metrics(
+                primary_model_logits,
+                encoded_text["input_ids"],
+                self.primary_model_agg_metrics,
+            )
+            agg_metrics.append(primary_model_agg_metrics)
 
         second_model_last_hidden_states = None
         if self.second_model is not None:
@@ -90,14 +102,23 @@ class FeatureExtractor(nn.Module):
             if self.second_model_metrics:
                 second_model_metrics = self._get_model_metrics(second_model_logits, encoded_text["input_ids"], self.second_model_metrics)
                 metrics.append(second_model_metrics)
+            if self.second_model_agg_metrics:
+                second_model_agg_metrics = self._get_model_agg_metrics(
+                    second_model_logits,
+                    encoded_text["input_ids"],
+                    self.second_model_agg_metrics,
+                )
+                agg_metrics.append(second_model_agg_metrics)
             if self.return_xppl:
                 xppl = self._get_xppl(primary_model_logits, second_model_logits)
                 metrics.append(xppl)
         
         metrics = torch.cat(metrics, dim=-1)
+        agg_metrics = torch.cat(agg_metrics, dim=-1) if agg_metrics else None
 
         return {
             "metrics": metrics,
+            "agg_metrics": agg_metrics,
             "primary_hidden_states": primary_model_last_hidden_states,
             "second_hidden_states": second_model_last_hidden_states,
             "attention_mask": encoded_text["attention_mask"],
@@ -139,8 +160,7 @@ class FeatureExtractor(nn.Module):
 
     def _get_xppl(self, logits_model_1: torch.Tensor, logits_model_2: torch.Tensor):
         shift_logits_model_1 = logits_model_1[:, :-1, :]
-        log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
-        probs_model_1 = log_probs_model_1.exp()
+        probs_model_1 = torch.softmax(shift_logits_model_1.float(), dim=-1)
 
         shift_logits_model_2 = logits_model_2[:, :-1, :]
         log_probs_model_2 = torch.log_softmax(shift_logits_model_2.float(), dim=-1)
@@ -148,3 +168,84 @@ class FeatureExtractor(nn.Module):
         xppl = -(probs_model_1 * log_probs_model_2).sum(dim=-1)
 
         return xppl.unsqueeze(-1) # [B, T, 1]
+
+    def _get_model_agg_metrics(self, logits: torch.Tensor, input_ids: torch.Tensor, metrics_list: list[str]) -> torch.Tensor:
+        shift_logits = logits[:, :-1, :]
+        shift_input_ids = input_ids[:, 1:]
+        log_probs = torch.log_softmax(shift_logits.float(), dim=-1)
+
+        log_likelihoods = log_probs.gather(-1, shift_input_ids.unsqueeze(-1)).squeeze(-1) # [B, T]
+        surprisals = -log_likelihoods # [B, T]
+        surprisals_diff = torch.diff(surprisals, dim=1) # [B, T-1]
+        log_likelihoods_diff_2nd = torch.diff(log_likelihoods, n=2, dim=1) # [B, T-2]
+
+        metrics = []
+
+        if "energy" in metrics_list:
+            log_likelihoods_centered = log_likelihoods - log_likelihoods.mean(dim=1, keepdim=True) # [B, T]
+            N = log_likelihoods_centered.shape[-1]
+            fft_log_probs = torch.fft.fft(log_likelihoods_centered, dim=1) # [B, T]
+            power_half = (fft_log_probs.abs() / N).pow(2)[:, :N // 2] # [B, T//2]
+            energy_total = -power_half.sum(dim=1) # [B]
+            metrics.append(energy_total)
+
+        if "mean" in metrics_list:
+            mean = surprisals.mean(dim=1)
+            metrics.append(mean)
+
+        if "std" in metrics_list:
+            std = surprisals.std(dim=1, correction=0)
+            metrics.append(std)
+        
+        if "var" in metrics_list:
+            var = surprisals.var(dim=1, correction=0)
+            metrics.append(var)
+
+        if "skew" in metrics_list:
+            mean = surprisals.mean(dim=1, keepdim=True)
+            diffs = surprisals - mean
+            std = surprisals.std(dim=1, keepdim=True, correction=0)
+            zscores = diffs / std
+            skew = zscores.pow(3).mean(dim=1)
+            metrics.append(skew)
+
+        if "kurtosis" in metrics_list:
+            mean = surprisals.mean(dim=1, keepdim=True)
+            diffs = surprisals - mean
+            std = surprisals.std(dim=1, keepdim=True, correction=0)
+            zscores = diffs / std
+            kurtosis = zscores.pow(4).mean(dim=1) - 3.0
+            metrics.append(kurtosis)
+
+        if "mean_diff" in metrics_list:
+            mean_diff = surprisals_diff.mean(dim=1)
+            metrics.append(mean_diff)
+
+        if "std_diff" in metrics_list:
+            std_diff = surprisals_diff.std(dim=1, correction=0)
+            metrics.append(std_diff)
+
+        if "var_2nd" in metrics_list:
+            var_2nd = log_likelihoods_diff_2nd.var(dim=1, correction=0)
+            metrics.append(var_2nd)
+
+        if "entropy_2nd" in metrics_list:
+            log_probs = log_likelihoods_diff_2nd
+            probs = log_probs.exp()
+            entropy_2nd = -(probs * log_probs).sum(dim=-1)
+            metrics.append(entropy_2nd)
+
+        if "autocorr_2nd" in metrics_list:
+            B, N = log_likelihoods_diff_2nd.shape
+            if N > 1:
+                shift_1 = log_likelihoods_diff_2nd[:, :-1]
+                shift_2 = log_likelihoods_diff_2nd[:, 1:]
+                shifts = torch.cat((shift_1, shift_2), dim=0)
+                corr_matrix = torch.corrcoef(shifts)
+                autocorr_2nd = torch.diagonal(corr_matrix[:B, B:])
+                metrics.append(autocorr_2nd)
+            else:
+                autocorr_2nd = torch.zeros(B, device=log_likelihoods_diff_2nd.device)
+                metrics.append(autocorr_2nd)
+
+        return torch.stack(metrics, dim=-1) # [B, M]

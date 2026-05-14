@@ -34,13 +34,19 @@ class PAWN(nn.Module):
             metrics_nn_input_dim += len(config.second_model_metrics)
         if config.return_xppl:
             metrics_nn_input_dim += 1
+        
+        agg_metrics_dim = len(config.primary_model_agg_metrics or [])
+        if config.second_model_agg_metrics is not None:
+            agg_metrics_dim += len(config.second_model_agg_metrics)
 
         self.feature_extractor = FeatureExtractor(
             primary_model_name=config.primary_model_name, 
             primary_model_metrics=config.primary_model_metrics,
+            primary_model_agg_metrics=config.primary_model_agg_metrics,
             max_length=config.max_length, 
             second_model_name=config.second_model_name,
             second_model_metrics=config.second_model_metrics,
+            second_model_agg_metrics=config.second_model_agg_metrics,
             return_xppl=config.return_xppl,
             return_second_model_hs=config.return_second_model_hs,
             hf_token=HF_TOKEN,
@@ -70,10 +76,12 @@ class PAWN(nn.Module):
             dropout=config.mlp_dropout,
             residual=config.residual,
         )
+        self.score_fusion = nn.Linear(agg_metrics_dim + 1, 1) if agg_metrics_dim > 0 else None
     
     def forward(self, texts: list[str], labels: torch.Tensor | None = None) -> torch.Tensor:
         features = self.feature_extractor(texts)
         metrics = features["metrics"]
+        agg_metrics = features["agg_metrics"]
         primary_hidden_states = features["primary_hidden_states"]
         second_hidden_states = features["second_hidden_states"]
         attention_mask = features["attention_mask"]
@@ -102,6 +110,8 @@ class PAWN(nn.Module):
 
         aggregated_input = (gate_logits.softmax(dim=-2) * metrics_features).sum(dim=-2)
         aggregated_output = self.aggregate_nn(aggregated_input)
+        if self.score_fusion is not None:
+            aggregated_output = self.score_fusion(torch.cat([aggregated_output, agg_metrics], dim=-1))
 
         return aggregated_output.squeeze(-1)
 

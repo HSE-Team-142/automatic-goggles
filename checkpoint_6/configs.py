@@ -16,8 +16,10 @@ class ModelConfig(BaseModel):
     token_dropout: float = 0.15
     residual: bool = True
     primary_model_metrics: Optional[list[str]] = ["entropy", "max_log_probs", "next_token_log_probs", "rank", "top_p"]
+    primary_model_agg_metrics: Optional[list[str]] = None
     second_model_name: Optional[str] = None
     second_model_metrics: Optional[list[str]] = None
+    second_model_agg_metrics: Optional[list[str]] = None
     return_xppl: Optional[bool] = False
     return_second_model_hs: Optional[bool] = False
 
@@ -25,6 +27,10 @@ class ModelConfig(BaseModel):
     def validate_dimensions(self) -> ModelConfig:
         if self.metric_features % self.gates != 0:
             raise ValueError("metric_features must be divisible by gates")
+        if self.second_model_metrics and self.second_model_name is None:
+            raise ValueError("second_model_name must be set when second_model_metrics is used")
+        if self.second_model_agg_metrics and self.second_model_name is None:
+            raise ValueError("second_model_name must be set when second_model_agg_metrics is used")
         return self
 
 
