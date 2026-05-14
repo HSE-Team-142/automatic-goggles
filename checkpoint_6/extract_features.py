@@ -170,6 +170,7 @@ class FeatureExtractor(nn.Module):
         return xppl.unsqueeze(-1) # [B, T, 1]
 
     def _get_model_agg_metrics(self, logits: torch.Tensor, input_ids: torch.Tensor, metrics_list: list[str]) -> torch.Tensor:
+        eps = torch.finfo(logits.float().dtype).eps
         shift_logits = logits[:, :-1, :]
         shift_input_ids = input_ids[:, 1:]
         log_probs = torch.log_softmax(shift_logits.float(), dim=-1)
@@ -205,7 +206,7 @@ class FeatureExtractor(nn.Module):
             mean = surprisals.mean(dim=1, keepdim=True)
             diffs = surprisals - mean
             std = surprisals.std(dim=1, keepdim=True, correction=0)
-            zscores = diffs / std
+            zscores = diffs / std.clamp_min(eps)
             skew = zscores.pow(3).mean(dim=1)
             metrics.append(skew)
 
@@ -213,7 +214,7 @@ class FeatureExtractor(nn.Module):
             mean = surprisals.mean(dim=1, keepdim=True)
             diffs = surprisals - mean
             std = surprisals.std(dim=1, keepdim=True, correction=0)
-            zscores = diffs / std
+            zscores = diffs / std.clamp_min(eps)
             kurtosis = zscores.pow(4).mean(dim=1) - 3.0
             metrics.append(kurtosis)
 
@@ -230,19 +231,29 @@ class FeatureExtractor(nn.Module):
             metrics.append(var_2nd)
 
         if "entropy_2nd" in metrics_list:
-            log_probs = log_likelihoods_diff_2nd
-            probs = log_probs.exp()
-            entropy_2nd = -(probs * log_probs).sum(dim=-1)
-            metrics.append(entropy_2nd)
+            entropies = []
+            for sample in log_likelihoods_diff_2nd:
+                if sample.numel() == 0:
+                    entropies.append(sample.new_zeros(()))
+                    continue
+
+                hist = torch.histogram(sample.float(), bins=20, density=False).hist
+                probs = hist / hist.sum().clamp_min(eps)
+                entropy_2nd = -(probs * probs.clamp_min(eps).log()).sum()
+                entropies.append(entropy_2nd.to(log_likelihoods_diff_2nd.dtype))
+
+            metrics.append(torch.stack(entropies))
 
         if "autocorr_2nd" in metrics_list:
             B, N = log_likelihoods_diff_2nd.shape
             if N > 1:
                 shift_1 = log_likelihoods_diff_2nd[:, :-1]
                 shift_2 = log_likelihoods_diff_2nd[:, 1:]
-                shifts = torch.cat((shift_1, shift_2), dim=0)
-                corr_matrix = torch.corrcoef(shifts)
-                autocorr_2nd = torch.diagonal(corr_matrix[:B, B:])
+                shift_1 = shift_1 - shift_1.mean(dim=1, keepdim=True)
+                shift_2 = shift_2 - shift_2.mean(dim=1, keepdim=True)
+                numerator = (shift_1 * shift_2).mean(dim=1)
+                denominator = shift_1.std(dim=1, correction=0) * shift_2.std(dim=1, correction=0)
+                autocorr_2nd = numerator / denominator.clamp_min(eps)
                 metrics.append(autocorr_2nd)
             else:
                 autocorr_2nd = torch.zeros(B, device=log_likelihoods_diff_2nd.device)
