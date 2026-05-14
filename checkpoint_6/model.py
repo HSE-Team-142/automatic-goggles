@@ -76,7 +76,19 @@ class PAWN(nn.Module):
             dropout=config.mlp_dropout,
             residual=config.residual,
         )
-        self.score_fusion = nn.Linear(agg_metrics_dim + 1, 1) if agg_metrics_dim > 0 else None
+        if agg_metrics_dim > 0:
+            self.agg_metrics_norm = nn.LayerNorm(agg_metrics_dim)
+            self.score_fusion = MLP(
+                input_dim=agg_metrics_dim + 1,
+                output_dim=1,
+                hidden_dim=config.mlp_hidden_features,
+                hidden_layers=1,
+                dropout=config.mlp_dropout,
+                residual=False,
+            )
+        else:
+            self.agg_metrics_norm = None
+            self.score_fusion = None
     
     def forward(self, texts: list[str], labels: torch.Tensor | None = None) -> torch.Tensor:
         features = self.feature_extractor(texts)
@@ -111,6 +123,7 @@ class PAWN(nn.Module):
         aggregated_input = (gate_logits.softmax(dim=-2) * metrics_features).sum(dim=-2)
         aggregated_output = self.aggregate_nn(aggregated_input)
         if self.score_fusion is not None:
+            agg_metrics = self.agg_metrics_norm(agg_metrics)
             aggregated_output = self.score_fusion(torch.cat([aggregated_output, agg_metrics], dim=-1))
 
         return aggregated_output.squeeze(-1)
