@@ -23,11 +23,14 @@ class ModelConfig(BaseModel):
     cross_model_agg_features: Optional[list[str]] = None
     return_xppl: Optional[bool] = False
     return_second_model_hs: Optional[bool] = False
+    hidden_state_fusion: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> ModelConfig:
         if self.metric_features % self.gates != 0:
             raise ValueError("metric_features must be divisible by gates")
+        if self.hidden_state_fusion not in (None, "last", "uniform"):
+            raise ValueError('hidden_state_fusion must be one of: None, "last", "uniform"')
         if self.second_model_metrics and self.second_model_name is None:
             raise ValueError("second_model_name must be set when second_model_metrics is used")
         if self.second_model_agg_metrics and self.second_model_name is None:

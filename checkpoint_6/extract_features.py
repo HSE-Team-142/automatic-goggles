@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import numpy as np
 
@@ -30,6 +31,7 @@ class FeatureExtractor(nn.Module):
         cross_model_agg_features: Optional[list[str]] = None,
         return_xppl: Optional[bool] = False,
         return_second_model_hs: Optional[bool] = False,
+        hidden_state_fusion: Optional[str] = None,
         hf_token: Optional[str] = None,
     ):
         super().__init__()
@@ -58,6 +60,7 @@ class FeatureExtractor(nn.Module):
         self.cross_model_agg_features = cross_model_agg_features or []
         self.return_xppl = return_xppl
         self.return_second_model_hs = return_second_model_hs
+        self.hidden_state_fusion = hidden_state_fusion or "last"
         self.second_model = None
         if second_model_name is not None:
             assert_tokenizer_consistency(primary_model_name, second_model_name, hf_token=hf_token)
@@ -80,7 +83,7 @@ class FeatureExtractor(nn.Module):
         with torch.no_grad():
             primary_model_outputs = self.primary_model(**encoded_text, output_hidden_states=True, use_cache=False,)
         primary_model_logits = primary_model_outputs.logits
-        primary_model_last_hidden_states = primary_model_outputs.hidden_states[-1]
+        primary_model_hidden_states = self._get_hidden_states(primary_model_outputs.hidden_states)
 
         primary_model_metrics = self._get_model_metrics(primary_model_logits, encoded_text["input_ids"], self.primary_model_metrics)
 
@@ -94,13 +97,13 @@ class FeatureExtractor(nn.Module):
             )
             agg_metrics.append(primary_model_agg_metrics)
 
-        second_model_last_hidden_states = None
+        second_model_hidden_states = None
         if self.second_model is not None:
             with torch.no_grad():
                 second_model_outputs = self.second_model(**encoded_text, output_hidden_states=self.return_second_model_hs, use_cache=False,)
             second_model_logits = second_model_outputs.logits
             if self.return_second_model_hs:
-                second_model_last_hidden_states = second_model_outputs.hidden_states[-1]
+                second_model_hidden_states = self._get_hidden_states(second_model_outputs.hidden_states)
             if self.second_model_metrics:
                 second_model_metrics = self._get_model_metrics(second_model_logits, encoded_text["input_ids"], self.second_model_metrics)
                 metrics.append(second_model_metrics)
@@ -129,10 +132,21 @@ class FeatureExtractor(nn.Module):
         return {
             "metrics": metrics,
             "agg_metrics": agg_metrics,
-            "primary_hidden_states": primary_model_last_hidden_states,
-            "second_hidden_states": second_model_last_hidden_states,
+            "primary_hidden_states": primary_model_hidden_states,
+            "second_hidden_states": second_model_hidden_states,
             "attention_mask": encoded_text["attention_mask"],
         }
+
+    def _get_hidden_states(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if self.hidden_state_fusion == "uniform":
+            layer_hidden_states = hidden_states[1:] if len(hidden_states) > 1 else hidden_states
+            normalized_hidden_states = [
+                F.layer_norm(hidden_state.float(), hidden_state.shape[-1:])
+                for hidden_state in layer_hidden_states
+            ]
+            return torch.stack(normalized_hidden_states, dim=0).mean(dim=0)
+
+        return hidden_states[-1]
     
     def _get_model_metrics(self, logits: torch.Tensor, input_ids: torch.Tensor, metrics_list: list[str]) -> torch.Tensor:
         shift_logits = logits[:, :-1, :]

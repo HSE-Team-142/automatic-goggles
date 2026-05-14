@@ -52,6 +52,7 @@ class PAWN(nn.Module):
             cross_model_agg_features=config.cross_model_agg_features,
             return_xppl=config.return_xppl,
             return_second_model_hs=config.return_second_model_hs,
+            hidden_state_fusion=config.hidden_state_fusion,
             hf_token=HF_TOKEN,
         )
 
