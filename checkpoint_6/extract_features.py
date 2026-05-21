@@ -184,12 +184,12 @@ class FeatureExtractor(nn.Module):
 
     def _get_xppl(self, logits_model_1: torch.Tensor, logits_model_2: torch.Tensor):
         shift_logits_model_1 = logits_model_1[:, :-1, :]
-        probs_model_1 = torch.softmax(shift_logits_model_1.float(), dim=-1)
+        log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
 
         shift_logits_model_2 = logits_model_2[:, :-1, :]
-        log_probs_model_2 = torch.log_softmax(shift_logits_model_2.float(), dim=-1)
+        probs_model_2 = torch.softmax(shift_logits_model_2.float(), dim=-1)
 
-        xppl = -(probs_model_1 * log_probs_model_2).sum(dim=-1)
+        xppl = -(probs_model_2 * log_probs_model_1).sum(dim=-1)
 
         return xppl.unsqueeze(-1) # [B, T, 1]
 
