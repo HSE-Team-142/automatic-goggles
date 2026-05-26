@@ -93,6 +93,7 @@ class FeatureExtractor(nn.Module):
             primary_model_agg_metrics = self._get_model_agg_metrics(
                 primary_model_logits,
                 encoded_text["input_ids"],
+                encoded_text["attention_mask"],
                 self.primary_model_agg_metrics,
             )
             agg_metrics.append(primary_model_agg_metrics)
@@ -111,14 +112,16 @@ class FeatureExtractor(nn.Module):
                 second_model_agg_metrics = self._get_model_agg_metrics(
                     second_model_logits,
                     encoded_text["input_ids"],
+                    encoded_text["attention_mask"],
                     self.second_model_agg_metrics,
                 )
                 agg_metrics.append(second_model_agg_metrics)
             if self.cross_model_agg_features:
-                cross_model_agg_features = self._get_cross_model_agg_features(
+                cross_model_agg_features = self._get_cross_model_agg_metrics(
                     primary_model_logits,
                     second_model_logits,
                     encoded_text["input_ids"],
+                    encoded_text["attention_mask"],
                     self.cross_model_agg_features,
                 )
                 agg_metrics.append(cross_model_agg_features)
@@ -193,75 +196,107 @@ class FeatureExtractor(nn.Module):
 
         return xppl.unsqueeze(-1) # [B, T, 1]
 
-    def _get_model_agg_metrics(self, logits: torch.Tensor, input_ids: torch.Tensor, metrics_list: list[str]) -> torch.Tensor:
+    def _get_model_agg_metrics(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        metrics_list: list[str],
+    ) -> torch.Tensor:
         eps = torch.finfo(logits.float().dtype).eps
         shift_logits = logits[:, :-1, :]
         shift_input_ids = input_ids[:, 1:]
+        valid_mask = attention_mask[:, 1:].bool()
         log_probs = torch.log_softmax(shift_logits.float(), dim=-1)
 
         log_likelihoods = log_probs.gather(-1, shift_input_ids.unsqueeze(-1)).squeeze(-1) # [B, T]
         surprisals = -log_likelihoods # [B, T]
         surprisals_diff = torch.diff(surprisals, dim=1) # [B, T-1]
         log_likelihoods_diff_2nd = torch.diff(log_likelihoods, n=2, dim=1) # [B, T-2]
+        diff_mask = valid_mask[:, 1:] & valid_mask[:, :-1]
+        diff_2nd_mask = diff_mask[:, 1:] & diff_mask[:, :-1]
 
         metrics = []
 
+        def __masked_mean(values: torch.Tensor, mask: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+            weights = mask.to(values.dtype)
+            numerator = (values * weights).sum(dim=1, keepdim=keepdim)
+            denominator = weights.sum(dim=1, keepdim=keepdim).clamp_min(1.0)
+            return numerator / denominator
+
+        def __masked_var(values: torch.Tensor, mask: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+            mean = __masked_mean(values, mask, keepdim=True)
+            variance = __masked_mean((values - mean).pow(2), mask, keepdim=True)
+            return variance if keepdim else variance.squeeze(1)
+
         if "energy" in metrics_list:
-            log_likelihoods_centered = log_likelihoods - log_likelihoods.mean(dim=1, keepdim=True) # [B, T]
-            N = log_likelihoods_centered.shape[-1]
-            fft_log_probs = torch.fft.fft(log_likelihoods_centered, dim=1) # [B, T]
-            power_half = (fft_log_probs.abs() / N).pow(2)[:, :N // 2] # [B, T//2]
-            energy_total = -power_half.sum(dim=1) # [B]
-            metrics.append(energy_total)
+            energy_values = []
+            for sample, mask in zip(log_likelihoods, valid_mask):
+                valid_sample = sample[mask]
+                if valid_sample.numel() == 0:
+                    energy_values.append(sample.new_zeros(()))
+                    continue
+
+                valid_sample = valid_sample - valid_sample.mean()
+                N = valid_sample.shape[0]
+                fft_log_probs = torch.fft.fft(valid_sample, dim=0)
+                power_half = (fft_log_probs.abs() / N).pow(2)[:N // 2]
+                energy_values.append(-power_half.sum())
+            metrics.append(torch.stack(energy_values))
 
         if "mean" in metrics_list:
-            mean = surprisals.mean(dim=1)
+            mean = __masked_mean(surprisals, valid_mask)
             metrics.append(mean)
 
         if "std" in metrics_list:
-            std = surprisals.std(dim=1, correction=0)
+            std = __masked_var(surprisals, valid_mask).sqrt()
             metrics.append(std)
         
         if "var" in metrics_list:
-            var = surprisals.var(dim=1, correction=0)
+            var = __masked_var(surprisals, valid_mask)
             metrics.append(var)
 
         if "skew" in metrics_list:
-            mean = surprisals.mean(dim=1, keepdim=True)
+            mean = __masked_mean(surprisals, valid_mask, keepdim=True)
             diffs = surprisals - mean
-            std = surprisals.std(dim=1, keepdim=True, correction=0)
+            std = __masked_var(surprisals, valid_mask, keepdim=True).sqrt()
             zscores = diffs / std.clamp_min(eps)
-            skew = zscores.pow(3).mean(dim=1)
+            skew = __masked_mean(zscores.pow(3), valid_mask)
             metrics.append(skew)
 
         if "kurtosis" in metrics_list:
-            mean = surprisals.mean(dim=1, keepdim=True)
+            mean = __masked_mean(surprisals, valid_mask, keepdim=True)
             diffs = surprisals - mean
-            std = surprisals.std(dim=1, keepdim=True, correction=0)
+            std = __masked_var(surprisals, valid_mask, keepdim=True).sqrt()
             zscores = diffs / std.clamp_min(eps)
-            kurtosis = zscores.pow(4).mean(dim=1) - 3.0
+            kurtosis = __masked_mean(zscores.pow(4), valid_mask) - 3.0
             metrics.append(kurtosis)
 
         if "mean_diff" in metrics_list:
-            mean_diff = surprisals_diff.mean(dim=1)
+            mean_diff = __masked_mean(surprisals_diff, diff_mask)
             metrics.append(mean_diff)
 
         if "std_diff" in metrics_list:
-            std_diff = surprisals_diff.std(dim=1, correction=0)
+            std_diff = __masked_var(surprisals_diff, diff_mask).sqrt()
             metrics.append(std_diff)
 
         if "var_2nd" in metrics_list:
-            var_2nd = log_likelihoods_diff_2nd.var(dim=1, correction=0)
+            var_2nd = __masked_var(log_likelihoods_diff_2nd, diff_2nd_mask)
             metrics.append(var_2nd)
 
         if "entropy_2nd" in metrics_list:
             entropies = []
-            for sample in log_likelihoods_diff_2nd:
+            bins = 20
+            for sample, mask in zip(log_likelihoods_diff_2nd, diff_2nd_mask):
+                sample = sample[mask]
                 if sample.numel() == 0:
                     entropies.append(sample.new_zeros(()))
                     continue
 
-                hist = torch.histogram(sample.float(), bins=20, density=False).hist
+                sample = sample.float()
+                sample_min = sample.min()
+                sample_max = sample.max()
+                hist = torch.histc(sample, bins=bins, min=sample_min.item(), max=sample_max.item())
                 probs = hist / hist.sum().clamp_min(eps)
                 entropy_2nd = -(probs * probs.clamp_min(eps).log()).sum()
                 entropies.append(entropy_2nd.to(log_likelihoods_diff_2nd.dtype))
@@ -269,32 +304,37 @@ class FeatureExtractor(nn.Module):
             metrics.append(torch.stack(entropies))
 
         if "autocorr_2nd" in metrics_list:
-            B, N = log_likelihoods_diff_2nd.shape
-            if N > 1:
-                shift_1 = log_likelihoods_diff_2nd[:, :-1]
-                shift_2 = log_likelihoods_diff_2nd[:, 1:]
+            autocorr_values = []
+            for sample, mask in zip(log_likelihoods_diff_2nd, diff_2nd_mask):
+                sample = sample[mask]
+                if sample.numel() <= 1:
+                    autocorr_values.append(sample.new_zeros(()))
+                    continue
+
+                shift_1 = sample[:-1].unsqueeze(0)
+                shift_2 = sample[1:].unsqueeze(0)
                 shift_1 = shift_1 - shift_1.mean(dim=1, keepdim=True)
                 shift_2 = shift_2 - shift_2.mean(dim=1, keepdim=True)
                 numerator = (shift_1 * shift_2).mean(dim=1)
                 denominator = shift_1.std(dim=1, correction=0) * shift_2.std(dim=1, correction=0)
                 autocorr_2nd = numerator / denominator.clamp_min(eps)
-                metrics.append(autocorr_2nd)
-            else:
-                autocorr_2nd = torch.zeros(B, device=log_likelihoods_diff_2nd.device)
-                metrics.append(autocorr_2nd)
+                autocorr_values.append(autocorr_2nd.squeeze(0))
+            metrics.append(torch.stack(autocorr_values))
 
         return torch.stack(metrics, dim=-1) # [B, M]
     
-    def _get_cross_model_agg_features(
+    def _get_cross_model_agg_metrics(
             self,
             logits_model_1: torch.Tensor,
             logits_model_2: torch.Tensor,
             input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
             metrics_list: list[str],
         ) -> torch.Tensor:
         eps = torch.finfo(logits_model_1.float().dtype).eps
         shift_logits_model_1 = logits_model_1[:, :-1, :]
         shift_input_ids = input_ids[:, 1:]
+        valid_mask = attention_mask[:, 1:].bool()
         log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
         log_likelihoods_model_1 = log_probs_model_1.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
         surprisals_model_1 = -log_likelihoods_model_1
@@ -306,14 +346,17 @@ class FeatureExtractor(nn.Module):
 
         metrics = []
 
-        mean_model_1 = surprisals_model_1.mean(dim=1, keepdim=True)
-        mean_model_2 = surprisals_model_2.mean(dim=1, keepdim=True)
+        weights = valid_mask.to(surprisals_model_1.dtype)
+        denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
 
-        diff_model_1 = surprisals_model_1 - mean_model_1
-        diff_model_2 = surprisals_model_2 - mean_model_2
+        mean_model_1 = (surprisals_model_1 * weights).sum(dim=1, keepdim=True) / denom
+        mean_model_2 = (surprisals_model_2 * weights).sum(dim=1, keepdim=True) / denom
+
+        diff_model_1 = (surprisals_model_1 - mean_model_1) * weights
+        diff_model_2 = (surprisals_model_2 - mean_model_2) * weights
 
         if "cov" in metrics_list:
-            cov = (diff_model_1 * diff_model_2).mean(dim=1)
+            cov = (diff_model_1 * diff_model_2).sum(dim=1) / denom.squeeze(1)
             metrics.append(cov)
 
         if "corr" in metrics_list:
@@ -325,7 +368,21 @@ class FeatureExtractor(nn.Module):
             metrics.append(corr)
 
         if "cos_sim" in metrics_list:
-            cos_sim = torch.cosine_similarity(surprisals_model_1, surprisals_model_2, dim=1, eps=eps)
+            masked_surprisals_model_1 = surprisals_model_1 * weights
+            masked_surprisals_model_2 = surprisals_model_2 * weights
+            cos_sim = torch.cosine_similarity(masked_surprisals_model_1, masked_surprisals_model_2, dim=1, eps=eps)
             metrics.append(cos_sim)
+        
+        if "binoculars_score" in metrics_list:
+            log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
+            probs_model_2 = torch.softmax(shift_logits_model_2.float(), dim=-1)
+
+            token_ppl = -log_likelihoods_model_1
+            token_xppl = -(probs_model_2 * log_probs_model_1).sum(dim=-1)
+            ppl = (token_ppl * weights).sum(dim=1) / denom.squeeze(1)
+            xppl = (token_xppl * weights).sum(dim=1) / denom.squeeze(1)
+            binoculars_score = ppl / xppl.clamp_min(eps)
+            metrics.append(binoculars_score)
+
 
         return torch.stack(metrics, dim=-1) # [B, M]
