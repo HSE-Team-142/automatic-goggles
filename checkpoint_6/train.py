@@ -60,13 +60,13 @@ def compute_metrics(eval_pred):
       return {
           "accuracy": accuracy_score(labels, preds),
 
-          "human_f1": f1_score(labels, preds, zero_division=0),
-          "human_precision": precision_score(labels, preds, zero_division=0),
-          "human_recall": recall_score(labels, preds, zero_division=0),
+          "ai_f1": f1_score(labels, preds, zero_division=0),
+          "ai_precision": precision_score(labels, preds, zero_division=0),
+          "ai_recall": recall_score(labels, preds, zero_division=0),
 
-          "ai_f1": f1_score(1 - labels, 1 - preds, zero_division=0),
-          "ai_precision": precision_score(1 - labels, 1 - preds, zero_division=0),
-          "ai_recall": recall_score(1 - labels, 1 - preds, zero_division=0),
+          "human_f1": f1_score(1 - labels, 1 - preds, zero_division=0),
+          "human_precision": precision_score(1 - labels, 1 - preds, zero_division=0),
+          "human_recall": recall_score(1 - labels, 1 - preds, zero_division=0),
 
           "roc_auc": roc_auc_score(labels, logits),
           "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
@@ -111,13 +111,12 @@ def _get_training_args(args):
         # Evaluation and logging
         eval_strategy="epoch",
         logging_strategy="steps",
-        logging_steps=100,
+        logging_steps=10,
         logging_dir=os.path.join(args.output_dir, "tensorboard"),
 
         # Saving strategy
         save_strategy="epoch",
         load_best_model_at_end=True,
-        save_total_limit=2,
 
         # Metric
         metric_for_best_model="roc_auc",
