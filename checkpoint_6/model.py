@@ -82,17 +82,12 @@ class PAWN(nn.Module):
         )
         if agg_metrics_dim > 0:
             self.agg_metrics_norm = nn.LayerNorm(agg_metrics_dim)
-            self.score_fusion = MLP(
-                input_dim=agg_metrics_dim + 1,
-                output_dim=1,
-                hidden_dim=config.mlp_hidden_features,
-                hidden_layers=1,
-                dropout=config.mlp_dropout,
-                residual=False,
-            )
+            self.agg_film = nn.Linear(agg_metrics_dim, 2 * config.metric_features)
+            nn.init.zeros_(self.agg_film.weight)
+            nn.init.zeros_(self.agg_film.bias)
         else:
             self.agg_metrics_norm = None
-            self.score_fusion = None
+            self.agg_film = None
     
     def forward(self, texts: list[str], labels: torch.Tensor | None = None) -> torch.Tensor:
         features = self.feature_extractor(texts)
@@ -125,10 +120,14 @@ class PAWN(nn.Module):
             gate_logits = gate_logits.repeat(1, 1, M // G)
 
         aggregated_input = (gate_logits.softmax(dim=-2) * metrics_features).sum(dim=-2)
-        aggregated_output = self.aggregate_nn(aggregated_input)
-        if self.score_fusion is not None:
+
+        if self.agg_film is not None:
             agg_metrics = self.agg_metrics_norm(agg_metrics)
-            aggregated_output = self.score_fusion(torch.cat([aggregated_output, agg_metrics], dim=-1))
+            gamma, beta = self.agg_film(agg_metrics).chunk(2, dim=-1)
+            gamma = 1.0 + gamma
+            aggregated_input = gamma * aggregated_input + beta
+        
+        aggregated_output = self.aggregate_nn(aggregated_input)
 
         return aggregated_output.squeeze(-1)
 
