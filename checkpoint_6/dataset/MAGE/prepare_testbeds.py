@@ -77,6 +77,16 @@ model_sets = [
 data_dir = sys.argv[1]
 dataset = load_dataset("yaful/MAGE")
 
+"""
+Изначально в датасете использовалось следующее распределение по категориям: 
+
+1 - Human-written, 0 - Machine-generated
+
+Чтобы соответствовать оригинальной работе, категории были поменяны местами: 
+
+0 - Human-written, 1 - Machine-generated
+"""
+
 def replace_labels(example):
     if example["label"] == 1:
         example["label"] = 0
