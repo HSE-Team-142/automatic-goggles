@@ -37,6 +37,10 @@ class ModelConfig(BaseModel):
             raise ValueError("second_model_name must be set when second_model_agg_metrics is used")
         if self.cross_model_agg_features and self.second_model_name is None:
             raise ValueError("second_model_name must be set when cross_model_agg_features is used")
+        if self.return_xppl and self.second_model_name is None:
+            raise ValueError("second_model_name must be set when return_xppl is used")
+        if self.return_second_model_hs and self.second_model_name is None:
+            raise ValueError("second_model_name must be set when return_second_model_hs is used")
         return self
 
 
