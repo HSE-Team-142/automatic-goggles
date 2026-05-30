@@ -5,7 +5,8 @@ import json
 import yaml
 
 import numpy as np
-from pathlib import Path
+
+import mlflow
 
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
@@ -108,23 +109,26 @@ def _get_training_args(args):
         lr_scheduler_type="cosine",
         warmup_steps=0,
 
-        # Evaluation and logging
+        # Evaluation
         eval_strategy="epoch",
-        logging_strategy="steps",
-        logging_steps=10,
-        logging_dir=os.path.join(args.output_dir, "tensorboard"),
 
         # Saving strategy
         save_strategy="epoch",
         load_best_model_at_end=True,
+        save_total_limit=1,
 
         # Metric
         metric_for_best_model="roc_auc",
         greater_is_better=True,
 
-        # Other
+        # MLFlow and logging
+        logging_strategy="steps",
+        logging_steps=10,
+        report_to="mlflow",
+        run_name=args.output_dir,
+
+        # Seed
         seed=trainer_config.seed,
-        report_to="tensorboard",
     )
 
     return training_args
@@ -188,6 +192,8 @@ def main() -> None:
         label_smoothing=optimizer_config.label_smoothing,
         pos_weight=optimizer_config.pos_weight,
     )
+
+    mlflow.set_experiment("pawn")
 
     trainer.train()
 
