@@ -6,8 +6,6 @@ import yaml
 
 import numpy as np
 
-import mlflow
-
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
@@ -89,6 +87,14 @@ def _get_training_args(args):
     data_config = config.data
 
 
+    logging_kwargs = {
+        "report_to": args.report_to,
+    }
+    if args.report_to == "tensorboard":
+        logging_kwargs["logging_dir"] = os.path.join(args.output_dir, "tensorboard")
+    elif args.report_to == "mlflow":
+        logging_kwargs["run_name"] = args.output_dir
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         
@@ -121,11 +127,10 @@ def _get_training_args(args):
         metric_for_best_model="roc_auc",
         greater_is_better=True,
 
-        # MLFlow and logging
+        # Logging
         logging_strategy="steps",
         logging_steps=10,
-        report_to="mlflow",
-        run_name=args.output_dir,
+        **logging_kwargs,
 
         # Seed
         seed=trainer_config.seed,
@@ -141,6 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid_dataset", type=str, required=True, help="Path to validation CSV.")
     parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
     parser.add_argument("--output_dir", type=str, default="output", help="Output directory override. Defaults to trainer.output_dir from the YAML config.",)
+    parser.add_argument("--report_to", type=str, choices=["tensorboard", "mlflow"], default="mlflow", help="Metrics logging backend for Hugging Face Trainer.")
 
     args = parser.parse_args()
     try:
@@ -193,7 +199,10 @@ def main() -> None:
         pos_weight=optimizer_config.pos_weight,
     )
 
-    mlflow.set_experiment("pawn")
+    if args.report_to == "mlflow":
+        import mlflow
+
+        mlflow.set_experiment("pawn")
 
     trainer.train()
 
