@@ -65,7 +65,5 @@ PYTHONPATH=pawn++ uv run pawn++/bert_baseline/run_bert_ood.py \
 pawn++/                         PAWN++ implementation and utilities
 pawn++/bert_baseline/           RoBERTa training and OOD evaluation
 pawn++/experiments/             Experiment configs and saved metrics
-pawn++/pawn_images/             Architecture diagrams
-Final_Experiments.ipynb         Experiment report and result tables
-ai-gen-detection/               Original PAWN implementation
+report.ipynb                    Experiment report and result tables
 ```
