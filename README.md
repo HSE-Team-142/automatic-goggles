@@ -10,6 +10,12 @@ Python 3.14 and `uv`:
 uv sync
 ```
 
+## Trained Model
+
+A trained PAWN++ checkpoint is available on Hugging Face:
+
+https://huggingface.co/crayden/pawnplus
+
 ## Train PAWN++
 
 ```bash
