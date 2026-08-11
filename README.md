@@ -4,7 +4,7 @@ PAWN++ is an extension of the [PAWN](https://www.sciencedirect.com/science/artic
 
 ## Setup
 
-Python 3.14 and `uv`:
+Python 3.13 and `uv`:
 
 ```bash
 uv sync
