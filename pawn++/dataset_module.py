@@ -6,17 +6,15 @@ import torch
 
 class TextDataset(torch.utils.data.Dataset):
     def __init__(self, data_path: str) -> None:
-        self.data = pl.read_csv(data_path)
+        data = pl.read_csv(data_path)
+        self.texts = data["text"].to_list()
+        self.labels = data["label"].to_list()
 
     def __len__(self) -> int:
-        return self.data.height
+        return len(self.texts)
 
     def __getitem__(self, index: int) -> tuple[str, float]:
-        row = self.data[index]
-        label = row["label"].item()
-        text = row["text"].item()
-
-        return text, label
+        return self.texts[index], self.labels[index]
 
 def collate_text_batch(batch: list[tuple[str, float]]) -> dict[str, Any]:
     texts, labels = zip(*batch)

@@ -40,7 +40,19 @@ def load_model(
 
     model = PAWN(config)
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    unexpected_trainable = [
+        key for key in unexpected_keys
+        if not key.startswith("feature_extractor.")
+    ]
+    missing_trainable = [
+        key for key in missing_keys
+        if not key.startswith("feature_extractor.")
+    ]
+    if unexpected_trainable:
+        raise ValueError(f"Unexpected trainable checkpoint keys: {unexpected_trainable}")
+    if missing_trainable:
+        raise ValueError(f"Missing trainable checkpoint keys: {missing_trainable}")
     model.to(device)
     model.eval()
 

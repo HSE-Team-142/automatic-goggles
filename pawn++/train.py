@@ -9,6 +9,7 @@ import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from tqdm import tqdm
 from configs import ExperimentConfig, build_experiment_config
 
 from dataset_module import TextDataset, collate_text_batch
@@ -46,6 +47,11 @@ class PAWNTrainer(Trainer):
         os.makedirs(output_dir, exist_ok=True)
         if state_dict is None:
             state_dict = self.model.state_dict()
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("feature_extractor.")
+        }
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
@@ -70,6 +76,85 @@ def compute_metrics(eval_pred):
           "roc_auc": roc_auc_score(labels, logits),
           "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
       }
+
+
+class CachedFeatureDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        dataset: TextDataset,
+        model: PAWN,
+        batch_size: int,
+        description: str,
+    ) -> None:
+        self.samples = []
+        feature_extractor = model.feature_extractor
+        feature_extractor.eval()
+
+        for start in tqdm(range(0, len(dataset), batch_size), desc=description):
+            texts = dataset.texts[start : start + batch_size]
+            labels = dataset.labels[start : start + batch_size]
+            features = feature_extractor(texts)
+            attention_mask = features["attention_mask"].detach().cpu()
+            lengths = attention_mask.sum(dim=1).tolist()
+
+            for index, label in enumerate(labels):
+                token_length = int(lengths[index])
+                metric_length = max(token_length - 1, 0)
+
+                sample_features = {
+                    "metrics": features["metrics"][index, :metric_length].detach().cpu(),
+                    "agg_metrics": (
+                        features["agg_metrics"][index].detach().cpu()
+                        if features["agg_metrics"] is not None
+                        else None
+                    ),
+                    "primary_hidden_states": features["primary_hidden_states"][index, :token_length].detach().cpu(),
+                    "second_hidden_states": (
+                        features["second_hidden_states"][index, :token_length].detach().cpu()
+                        if features["second_hidden_states"] is not None
+                        else None
+                    ),
+                    "attention_mask": attention_mask[index, :token_length],
+                }
+                self.samples.append((sample_features, label))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        return self.samples[index]
+
+
+def collate_feature_batch(batch: list[tuple[dict[str, torch.Tensor], float]]) -> dict[str, torch.Tensor]:
+    sample_features, labels = zip(*batch)
+    features = {
+        "metrics": torch.nn.utils.rnn.pad_sequence(
+            [sample["metrics"] for sample in sample_features],
+            batch_first=True,
+        ),
+        "agg_metrics": None,
+        "primary_hidden_states": torch.nn.utils.rnn.pad_sequence(
+            [sample["primary_hidden_states"] for sample in sample_features],
+            batch_first=True,
+        ),
+        "second_hidden_states": None,
+        "attention_mask": torch.nn.utils.rnn.pad_sequence(
+            [sample["attention_mask"] for sample in sample_features],
+            batch_first=True,
+        ),
+    }
+    if sample_features[0]["agg_metrics"] is not None:
+        features["agg_metrics"] = torch.stack([sample["agg_metrics"] for sample in sample_features])
+    if sample_features[0]["second_hidden_states"] is not None:
+        features["second_hidden_states"] = torch.nn.utils.rnn.pad_sequence(
+            [sample["second_hidden_states"] for sample in sample_features],
+            batch_first=True,
+        )
+
+    return {
+        "features": features,
+        "labels": torch.tensor(labels, dtype=torch.float32),
+    }
 
 
 def _default_device() -> str:
@@ -130,6 +215,7 @@ def _get_training_args(args):
         # Logging
         logging_strategy="steps",
         logging_steps=10,
+        remove_unused_columns=False,
         **logging_kwargs,
 
         # Seed
@@ -147,6 +233,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_dataset", type=str, required=True, help="Path to test CSV.")
     parser.add_argument("--output_dir", type=str, default="output", help="Output directory override. Defaults to trainer.output_dir from the YAML config.",)
     parser.add_argument("--report_to", type=str, choices=["tensorboard", "mlflow"], default="mlflow", help="Metrics logging backend for Hugging Face Trainer.")
+    parser.add_argument(
+        "--precompute_features",
+        action="store_true",
+        help="Cache frozen LM features in memory before training. Faster for multi-epoch runs, but can use a lot of RAM.",
+    )
 
     args = parser.parse_args()
     try:
@@ -184,13 +275,34 @@ def main() -> None:
     model = PAWN(model_config).to(device)
 
     training_args = _get_training_args(args)
+    data_collator = collate_text_batch
+    if args.precompute_features:
+        train_dataset = CachedFeatureDataset(
+            train_dataset,
+            model,
+            batch_size=config.data.batch_size,
+            description="precompute train features",
+        )
+        eval_dataset = CachedFeatureDataset(
+            eval_dataset,
+            model,
+            batch_size=config.data.eval_batch_size,
+            description="precompute validation features",
+        )
+        test_dataset = CachedFeatureDataset(
+            test_dataset,
+            model,
+            batch_size=config.data.eval_batch_size,
+            description="precompute test features",
+        )
+        data_collator = collate_feature_batch
 
     trainer = PAWNTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=collate_text_batch,
+        data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(
             early_stopping_patience=5,

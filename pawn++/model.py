@@ -89,8 +89,16 @@ class PAWN(nn.Module):
             self.agg_metrics_norm = None
             self.agg_film = None
     
-    def forward(self, texts: list[str], labels: torch.Tensor | None = None) -> torch.Tensor:
-        features = self.feature_extractor(texts)
+    def forward(
+        self,
+        texts: list[str] | None = None,
+        features: dict[str, torch.Tensor] | None = None,
+        labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if features is None:
+            if texts is None:
+                raise ValueError("PAWN.forward requires either texts or precomputed features.")
+            features = self.feature_extractor(texts)
         metrics = features["metrics"]
         agg_metrics = features["agg_metrics"]
         primary_hidden_states = features["primary_hidden_states"]

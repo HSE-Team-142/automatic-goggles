@@ -80,53 +80,53 @@ class FeatureExtractor(nn.Module):
     def forward(self, text: list[str]) -> torch.Tensor:
         self.primary_model.eval()
         encoded_text = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length).to(self.primary_model.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             primary_model_outputs = self.primary_model(**encoded_text, output_hidden_states=True, use_cache=False,)
         primary_model_logits = primary_model_outputs.logits
         primary_model_hidden_states = self._get_hidden_states(primary_model_outputs.hidden_states)
+        primary_stats = self._get_next_token_stats(primary_model_logits, encoded_text["input_ids"])
 
-        primary_model_metrics = self._get_model_metrics(primary_model_logits, encoded_text["input_ids"], self.primary_model_metrics)
+        primary_model_metrics = self._get_model_metrics(primary_stats, self.primary_model_metrics)
 
         metrics = [primary_model_metrics]
         agg_metrics = []
         if self.primary_model_agg_metrics:
             primary_model_agg_metrics = self._get_model_agg_metrics(
-                primary_model_logits,
-                encoded_text["input_ids"],
+                primary_stats,
                 encoded_text["attention_mask"],
                 self.primary_model_agg_metrics,
             )
             agg_metrics.append(primary_model_agg_metrics)
 
         second_model_hidden_states = None
+        second_stats = None
         if self.second_model is not None:
-            with torch.no_grad():
+            with torch.inference_mode():
                 second_model_outputs = self.second_model(**encoded_text, output_hidden_states=self.return_second_model_hs, use_cache=False,)
             second_model_logits = second_model_outputs.logits
+            second_stats = self._get_next_token_stats(second_model_logits, encoded_text["input_ids"])
             if self.return_second_model_hs:
                 second_model_hidden_states = self._get_hidden_states(second_model_outputs.hidden_states)
             if self.second_model_metrics:
-                second_model_metrics = self._get_model_metrics(second_model_logits, encoded_text["input_ids"], self.second_model_metrics)
+                second_model_metrics = self._get_model_metrics(second_stats, self.second_model_metrics)
                 metrics.append(second_model_metrics)
             if self.second_model_agg_metrics:
                 second_model_agg_metrics = self._get_model_agg_metrics(
-                    second_model_logits,
-                    encoded_text["input_ids"],
+                    second_stats,
                     encoded_text["attention_mask"],
                     self.second_model_agg_metrics,
                 )
                 agg_metrics.append(second_model_agg_metrics)
             if self.cross_model_agg_features:
                 cross_model_agg_features = self._get_cross_model_agg_metrics(
-                    primary_model_logits,
-                    second_model_logits,
-                    encoded_text["input_ids"],
+                    primary_stats,
+                    second_stats,
                     encoded_text["attention_mask"],
                     self.cross_model_agg_features,
                 )
                 agg_metrics.append(cross_model_agg_features)
             if self.return_xppl:
-                xppl = self._get_xppl(primary_model_logits, second_model_logits)
+                xppl = self._get_xppl(primary_stats["log_probs"], second_stats["probs"])
                 metrics.append(xppl)
         
         metrics = torch.cat(metrics, dim=-1)
@@ -151,13 +151,23 @@ class FeatureExtractor(nn.Module):
 
         return hidden_states[-1]
     
-    def _get_model_metrics(self, logits: torch.Tensor, input_ids: torch.Tensor, metrics_list: list[str]) -> torch.Tensor:
+    def _get_next_token_stats(self, logits: torch.Tensor, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         shift_logits = logits[:, :-1, :]
         shift_input_ids = input_ids[:, 1:]
         log_probs = torch.log_softmax(shift_logits.float(), dim=-1)
         probs = log_probs.exp()
-
         next_token_log_probs = log_probs.gather(-1, shift_input_ids.unsqueeze(-1)).squeeze(-1)
+
+        return {
+            "log_probs": log_probs,
+            "probs": probs,
+            "next_token_log_probs": next_token_log_probs,
+        }
+
+    def _get_model_metrics(self, stats: dict[str, torch.Tensor], metrics_list: list[str]) -> torch.Tensor:
+        log_probs = stats["log_probs"]
+        probs = stats["probs"]
+        next_token_log_probs = stats["next_token_log_probs"]
 
         metrics = []
 
@@ -185,31 +195,22 @@ class FeatureExtractor(nn.Module):
             
         return torch.stack(metrics, dim=-1) # [B, T, M]
 
-    def _get_xppl(self, logits_model_1: torch.Tensor, logits_model_2: torch.Tensor):
-        shift_logits_model_1 = logits_model_1[:, :-1, :]
-        log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
-
-        shift_logits_model_2 = logits_model_2[:, :-1, :]
-        probs_model_2 = torch.softmax(shift_logits_model_2.float(), dim=-1)
-
+    def _get_xppl(self, log_probs_model_1: torch.Tensor, probs_model_2: torch.Tensor):
         xppl = -(probs_model_2 * log_probs_model_1).sum(dim=-1)
 
         return xppl.unsqueeze(-1) # [B, T, 1]
 
     def _get_model_agg_metrics(
         self,
-        logits: torch.Tensor,
-        input_ids: torch.Tensor,
+        stats: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
         metrics_list: list[str],
     ) -> torch.Tensor:
-        eps = torch.finfo(logits.float().dtype).eps
-        shift_logits = logits[:, :-1, :]
-        shift_input_ids = input_ids[:, 1:]
+        log_probs = stats["log_probs"]
+        log_likelihoods = stats["next_token_log_probs"]
+        eps = torch.finfo(log_probs.dtype).eps
         valid_mask = attention_mask[:, 1:].bool()
-        log_probs = torch.log_softmax(shift_logits.float(), dim=-1)
 
-        log_likelihoods = log_probs.gather(-1, shift_input_ids.unsqueeze(-1)).squeeze(-1) # [B, T]
         surprisals = -log_likelihoods # [B, T]
         surprisals_diff = torch.diff(surprisals, dim=1) # [B, T-1]
         log_likelihoods_diff_2nd = torch.diff(log_likelihoods, n=2, dim=1) # [B, T-2]
@@ -325,23 +326,19 @@ class FeatureExtractor(nn.Module):
     
     def _get_cross_model_agg_metrics(
             self,
-            logits_model_1: torch.Tensor,
-            logits_model_2: torch.Tensor,
-            input_ids: torch.Tensor,
+            stats_model_1: dict[str, torch.Tensor],
+            stats_model_2: dict[str, torch.Tensor],
             attention_mask: torch.Tensor,
             metrics_list: list[str],
         ) -> torch.Tensor:
-        eps = torch.finfo(logits_model_1.float().dtype).eps
-        shift_logits_model_1 = logits_model_1[:, :-1, :]
-        shift_input_ids = input_ids[:, 1:]
+        log_probs_model_1 = stats_model_1["log_probs"]
+        log_likelihoods_model_1 = stats_model_1["next_token_log_probs"]
+        log_probs_model_2 = stats_model_2["log_probs"]
+        log_likelihoods_model_2 = stats_model_2["next_token_log_probs"]
+        eps = torch.finfo(log_probs_model_1.dtype).eps
         valid_mask = attention_mask[:, 1:].bool()
-        log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
-        log_likelihoods_model_1 = log_probs_model_1.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
         surprisals_model_1 = -log_likelihoods_model_1
 
-        shift_logits_model_2 = logits_model_2[:, :-1, :]
-        log_probs_model_2 = torch.log_softmax(shift_logits_model_2.float(), dim=-1)
-        log_likelihoods_model_2 = log_probs_model_2.gather(dim=-1, index=shift_input_ids.unsqueeze(-1)).squeeze(-1)
         surprisals_model_2 = -log_likelihoods_model_2
 
         metrics = []
@@ -374,8 +371,7 @@ class FeatureExtractor(nn.Module):
             metrics.append(cos_sim)
         
         if "binoculars_score" in metrics_list:
-            log_probs_model_1 = torch.log_softmax(shift_logits_model_1.float(), dim=-1)
-            probs_model_2 = torch.softmax(shift_logits_model_2.float(), dim=-1)
+            probs_model_2 = stats_model_2["probs"]
 
             token_ppl = -log_likelihoods_model_1
             token_xppl = -(probs_model_2 * log_probs_model_1).sum(dim=-1)
