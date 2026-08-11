@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 CONFIG="${CONFIG:-pawn++/experiments/MAGE/configs/pawn/two_models/mage_llama_instruct_llama_base_metrics_xppl_hs_uniform_agg_metrics_full.yaml}"
 TRAIN_DATASET="${TRAIN_DATASET:-pawn++/mage/testbeds/cross_domains_cross_models/train.csv}"
