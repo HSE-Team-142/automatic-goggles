@@ -30,10 +30,35 @@ uv run pawn++/train.py \
 
 Experiment configurations are stored under `pawn++/experiments/`. Training selects the best checkpoint by validation AUROC and writes test metrics to `test_metrics.json`.
 
+For multi-GPU DDP training, launch the same script with `torchrun`; `--nproc_per_node` should match the number of GPUs:
+
+```bash
+uv run torchrun --nproc_per_node=4 pawn++/train.py \
+  --config pawn++/experiments/MAGE/configs/pawn/single_model/mage_llama_instruct.yaml \
+  --train_dataset path/to/train.csv \
+  --valid_dataset path/to/valid.csv \
+  --test_dataset path/to/test.csv \
+  --output_dir output/pawn \
+  --report_to tensorboard
+```
+
 ## Train RoBERTa Baseline
 
 ```bash
 PYTHONPATH=pawn++ uv run pawn++/bert_baseline/train_bert.py \
+  --base_model FacebookAI/roberta-base \
+  --train_dataset path/to/train.csv \
+  --valid_dataset path/to/valid.csv \
+  --test_dataset path/to/test.csv \
+  --output_dir output/roberta \
+  --label_smoothing 0.2 \
+  --pos_weight 0.413
+```
+
+DDP launch:
+
+```bash
+PYTHONPATH=pawn++ uv run torchrun --nproc_per_node=4 pawn++/bert_baseline/train_bert.py \
   --base_model FacebookAI/roberta-base \
   --train_dataset path/to/train.csv \
   --valid_dataset path/to/valid.csv \
@@ -51,9 +76,11 @@ PAWN++:
 uv run pawn++/run_pawn_ood.py \
   --config path/to/config.yaml \
   --checkpoint path/to/pytorch_model.bin \
-  --datasets path/to/test_ood.csv \
-  --output_dir output/ood
+  --splits train extra \
+  --output_dir results
 ```
+
+This evaluates RAID's labeled, non-adversarial `train` and `extra` partitions. Do not pass `test`: it has no labels for local metric computation. Prediction rows are flushed every 100 batches by default; set `--flush_every_batches` to change that interval.
 
 RoBERTa:
 

@@ -125,38 +125,34 @@ class RAIDTextDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, index: int) -> tuple[str, int, dict]:
+    def __getitem__(self, index: int) -> tuple[str, int, str]:
         row = self.data[index]
-        return row["generation"], int(row["model"] != "human"), row
+        return row["generation"], int(row["model"] != "human"), row["id"]
 
 
-def collate_raid_batch(batch: list[tuple[str, int, dict]]) -> dict:
-    texts, labels, records = zip(*batch)
+def collate_raid_batch(batch: list[tuple[str, int, str]]) -> dict:
+    texts, labels, ids = zip(*batch)
     return {
         "texts": list(texts),
         "labels": torch.tensor(labels, dtype=torch.float32),
-        "records": list(records),
+        "ids": list(ids),
     }
 
 
 def write_predictions(
     file,
-    records: list[dict],
-    labels: torch.Tensor,
+    ids: list[str],
     logits: torch.Tensor,
     include_header: bool,
 ) -> None:
-    labels_array = labels.numpy().astype(int)
     logits_array = logits.numpy().reshape(-1)
-    # Early RAID rows can contain only nulls for optional metadata such as
-    # ``decoding``. Infer from the whole flushed chunk so later string values
-    # do not conflict with Polars' default 100-row sample.
-    pl.DataFrame(records, infer_schema_length=None).with_columns(
-        pl.col("model").alias("generator"),
-        pl.Series("label", labels_array),
-        pl.Series("logit", logits_array),
-        pl.Series("probability", 1.0 / (1.0 + np.exp(-logits_array))),
-        pl.Series("prediction", (logits_array >= 0).astype(int)),
+    pl.DataFrame(
+        {
+            "id": ids,
+            "logit": logits_array,
+            "probability": 1.0 / (1.0 + np.exp(-logits_array)),
+            "prediction": (logits_array >= 0).astype(int),
+        }
     ).write_csv(file, include_header=include_header)
     file.flush()
     os.fsync(file.fileno())
@@ -196,7 +192,7 @@ def load_raid_datasets(splits: list[str]) -> dict[str, RAIDTextDataset]:
         data_files={split: f"{RAID_DATA_URL}/{split}_none.csv" for split in splits},
     )
     datasets = {}
-    required_columns = {"generation", "model"}
+    required_columns = {"id", "generation", "model"}
     for split in splits:
         data = raid[split]
         missing_columns = required_columns - set(data.column_names)
@@ -237,9 +233,8 @@ def evaluate_dataset(
     all_logits = []
     all_labels = []
     local_indices = np.arange(rank, len(dataset), world_size)
-    pending_records = []
+    pending_ids = []
     pending_logits = []
-    pending_labels = []
     has_written_predictions = False
 
     model.eval()
@@ -257,28 +252,24 @@ def evaluate_dataset(
             logits = model(texts=batch["texts"]).detach().cpu()
             all_labels.append(labels)
             all_logits.append(logits)
-            pending_records.extend(batch["records"])
-            pending_labels.append(labels)
+            pending_ids.extend(batch["ids"])
             pending_logits.append(logits)
 
             if (batch_index + 1) % flush_every_batches == 0:
                 write_predictions(
                     prediction_file,
-                    pending_records,
-                    torch.cat(pending_labels),
+                    pending_ids,
                     torch.cat(pending_logits),
                     include_header=not has_written_predictions,
                 )
-                pending_records.clear()
-                pending_labels.clear()
+                pending_ids.clear()
                 pending_logits.clear()
                 has_written_predictions = True
 
-        if pending_records:
+        if pending_ids:
             write_predictions(
                 prediction_file,
-                pending_records,
-                torch.cat(pending_labels),
+                pending_ids,
                 torch.cat(pending_logits),
                 include_header=not has_written_predictions,
             )
