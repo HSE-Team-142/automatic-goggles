@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,6 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from configs import build_experiment_config
-from dataset_module import collate_text_batch
 from model import PAWN
 
 
@@ -99,6 +99,25 @@ def compute_metrics(labels: np.ndarray, logits: np.ndarray) -> dict[str, float]:
     }
 
 
+def combine_distributed_predictions(
+    shards: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None],
+    dataset_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate and order every rank's non-overlapping evaluation shard."""
+    completed_shards = [shard for shard in shards if shard is not None]
+    indices = np.concatenate([shard[0] for shard in completed_shards])
+    labels = np.concatenate([shard[1] for shard in completed_shards])
+    logits = np.concatenate([shard[2] for shard in completed_shards])
+
+    expected_indices = np.arange(dataset_size)
+    order = np.argsort(indices)
+    if not np.array_equal(indices[order], expected_indices):
+        raise RuntimeError(
+            "Distributed evaluation did not receive exactly one prediction for every RAID row."
+        )
+    return labels[order], logits[order]
+
+
 class RAIDTextDataset(torch.utils.data.Dataset):
     def __init__(self, data) -> None:
         self.data = data
@@ -106,9 +125,57 @@ class RAIDTextDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, index: int) -> tuple[str, int]:
+    def __getitem__(self, index: int) -> tuple[str, int, dict]:
         row = self.data[index]
-        return row["generation"], int(row["model"] != "human")
+        return row["generation"], int(row["model"] != "human"), row
+
+
+def collate_raid_batch(batch: list[tuple[str, int, dict]]) -> dict:
+    texts, labels, records = zip(*batch)
+    return {
+        "texts": list(texts),
+        "labels": torch.tensor(labels, dtype=torch.float32),
+        "records": list(records),
+    }
+
+
+def write_predictions(
+    file,
+    records: list[dict],
+    labels: torch.Tensor,
+    logits: torch.Tensor,
+    include_header: bool,
+) -> None:
+    labels_array = labels.numpy().astype(int)
+    logits_array = logits.numpy().reshape(-1)
+    pl.DataFrame(records).with_columns(
+        pl.col("model").alias("generator"),
+        pl.Series("label", labels_array),
+        pl.Series("logit", logits_array),
+        pl.Series("probability", 1.0 / (1.0 + np.exp(-logits_array))),
+        pl.Series("prediction", (logits_array >= 0).astype(int)),
+    ).write_csv(file, include_header=include_header)
+    file.flush()
+    os.fsync(file.fileno())
+
+
+def merge_prediction_shards(shard_paths: list[Path], destination: Path) -> None:
+    with destination.open("wb") as output_file:
+        wrote_header = False
+        for shard_path in shard_paths:
+            with shard_path.open("rb") as shard_file:
+                header = shard_file.readline()
+                if not header:
+                    continue
+                if not wrote_header:
+                    output_file.write(header)
+                    wrote_header = True
+                shutil.copyfileobj(shard_file, output_file)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+
+    for shard_path in shard_paths:
+        shard_path.unlink()
 
 
 def load_raid_datasets(splits: list[str]) -> dict[str, RAIDTextDataset]:
@@ -146,6 +213,7 @@ def evaluate_dataset(
     output_dir: Path,
     rank: int,
     world_size: int,
+    flush_every_batches: int,
 ) -> dict[str, float] | None:
     # Unlike DistributedSampler, this does not pad the final shard with duplicate rows.
     shard = Subset(dataset, range(rank, len(dataset), world_size))
@@ -153,30 +221,86 @@ def evaluate_dataset(
         shard,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_text_batch,
+        collate_fn=collate_raid_batch,
     )
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_path = output_dir / f"{split}_predictions.csv"
+    shard_path = (
+        output_dir / f".{split}_rank{rank}_predictions.csv"
+        if world_size > 1
+        else prediction_path
+    )
     all_logits = []
     all_labels = []
+    local_indices = np.arange(rank, len(dataset), world_size)
+    pending_records = []
+    pending_logits = []
+    pending_labels = []
+    has_written_predictions = False
 
     model.eval()
-    with torch.inference_mode():
-        for batch in tqdm(dataloader, desc=f"evaluate RAID {split} (rank {rank})", disable=rank != 0):
+    with shard_path.open("w", encoding="utf-8", newline="") as prediction_file, torch.inference_mode():
+        for batch_index, batch in enumerate(
+            tqdm(
+                dataloader,
+                desc=f"RAID {split} | rank {rank}/{world_size} | {len(shard)} rows",
+                position=rank,
+                leave=True,
+                dynamic_ncols=True,
+            )
+        ):
             labels = batch["labels"].cpu()
             logits = model(texts=batch["texts"]).detach().cpu()
             all_labels.append(labels)
             all_logits.append(logits)
+            pending_records.extend(batch["records"])
+            pending_labels.append(labels)
+            pending_logits.append(logits)
 
-    local_labels = torch.cat(all_labels).numpy().astype(int)
-    local_logits = torch.cat(all_logits).numpy().reshape(-1)
+            if (batch_index + 1) % flush_every_batches == 0:
+                write_predictions(
+                    prediction_file,
+                    pending_records,
+                    torch.cat(pending_labels),
+                    torch.cat(pending_logits),
+                    include_header=not has_written_predictions,
+                )
+                pending_records.clear()
+                pending_labels.clear()
+                pending_logits.clear()
+                has_written_predictions = True
+
+        if pending_records:
+            write_predictions(
+                prediction_file,
+                pending_records,
+                torch.cat(pending_labels),
+                torch.cat(pending_logits),
+                include_header=not has_written_predictions,
+            )
+
+    local_labels = (
+        torch.cat(all_labels).numpy().astype(int) if all_labels else np.empty(0, dtype=int)
+    )
+    local_logits = (
+        torch.cat(all_logits).numpy().reshape(-1) if all_logits else np.empty(0, dtype=float)
+    )
 
     if world_size > 1:
-        gathered: list[tuple[np.ndarray, np.ndarray] | None] = [None] * world_size
-        dist.gather_object((local_labels, local_logits), gathered if rank == 0 else None, dst=0)
+        gathered: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = [None] * world_size
+        dist.gather_object(
+            (local_indices, local_labels, local_logits),
+            gathered if rank == 0 else None,
+            dst=0,
+        )
         if rank != 0:
             return None
-        labels = np.concatenate([item[0] for item in gathered if item is not None])
-        logits = np.concatenate([item[1] for item in gathered if item is not None])
+        labels, logits = combine_distributed_predictions(gathered, len(dataset))
+        merge_prediction_shards(
+            [output_dir / f".{split}_rank{other_rank}_predictions.csv" for other_rank in range(world_size)],
+            prediction_path,
+        )
     else:
         labels = local_labels
         logits = local_logits
@@ -186,15 +310,6 @@ def evaluate_dataset(
     stem = split
     with (output_dir / f"{stem}_metrics.json").open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2)
-
-    pl.DataFrame(
-        {
-            "label": labels,
-            "logit": logits,
-            "probability": 1.0 / (1.0 + np.exp(-logits)),
-            "prediction": (logits >= 0).astype(int),
-        }
-    ).write_csv(output_dir / f"{stem}_predictions.csv")
 
     return metrics
 
@@ -206,12 +321,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--splits", nargs="+", default=DEFAULT_RAID_SPLITS, help="RAID splits to evaluate.")
     parser.add_argument("--output_dir", type=Path, default=Path("results"))
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument(
+        "--flush_every_batches",
+        type=int,
+        default=100,
+        help="Flush prediction rows to disk after this many batches.",
+    )
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.flush_every_batches < 1:
+        raise ValueError("--flush_every_batches must be at least 1.")
     rank, local_rank, world_size = distributed_context()
     try:
         config = load_config(args.config)
@@ -232,6 +355,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 rank=rank,
                 world_size=world_size,
+                flush_every_batches=args.flush_every_batches,
             )
             if rank == 0:
                 all_metrics[split] = metrics
