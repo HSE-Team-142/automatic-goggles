@@ -177,7 +177,10 @@ def merge_prediction_shards(shard_paths: list[Path], destination: Path) -> None:
         shard_path.unlink()
 
 
-def load_raid_datasets(splits: list[str]) -> dict[str, RAIDTextDataset]:
+def load_raid_datasets(
+    splits: list[str],
+    raid_data_dir: Path | None = None,
+) -> dict[str, RAIDTextDataset]:
     unsupported_splits = set(splits) - LABELED_RAID_SPLITS
     if unsupported_splits:
         raise ValueError(
@@ -186,10 +189,18 @@ def load_raid_datasets(splits: list[str]) -> dict[str, RAIDTextDataset]:
         )
 
     # RAID publishes these smaller, clean partitions specifically for evaluations
-    # that do not include adversarial attacks.
+    # that do not include adversarial attacks.  Compute nodes commonly have no
+    # network access, so allow the CSVs to be staged on shared storage first.
+    data_files = {}
+    for split in splits:
+        filename = f"{split}_none.csv"
+        path = raid_data_dir / filename if raid_data_dir else None
+        if path is not None and not path.is_file():
+            raise FileNotFoundError(f"Missing staged RAID split: {path}")
+        data_files[split] = str(path) if path is not None else f"{RAID_DATA_URL}/{filename}"
     raid = load_dataset(
         "csv",
-        data_files={split: f"{RAID_DATA_URL}/{split}_none.csv" for split in splits},
+        data_files=data_files,
     )
     datasets = {}
     required_columns = {"id", "generation", "model"}
@@ -314,6 +325,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=Path(DEFAULT_CHECKPOINT))
     parser.add_argument("--splits", nargs="+", default=DEFAULT_RAID_SPLITS, help="RAID splits to evaluate.")
     parser.add_argument("--output_dir", type=Path, default=Path("results"))
+    parser.add_argument(
+        "--raid_data_dir",
+        type=Path,
+        default=None,
+        help="Directory containing staged train_none.csv and extra_none.csv. "
+        "Use this on compute nodes without internet access.",
+    )
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument(
         "--flush_every_batches",
@@ -338,7 +356,7 @@ def main() -> None:
         model = PAWN(config.model).to(device)
         load_pawn_checkpoint(model, args.checkpoint)
 
-        datasets = load_raid_datasets(args.splits)
+        datasets = load_raid_datasets(args.splits, args.raid_data_dir)
         all_metrics = {}
         for split, dataset in datasets.items():
             metrics = evaluate_dataset(
