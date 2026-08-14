@@ -148,7 +148,10 @@ def write_predictions(
 ) -> None:
     labels_array = labels.numpy().astype(int)
     logits_array = logits.numpy().reshape(-1)
-    pl.DataFrame(records).with_columns(
+    # Early RAID rows can contain only nulls for optional metadata such as
+    # ``decoding``. Infer from the whole flushed chunk so later string values
+    # do not conflict with Polars' default 100-row sample.
+    pl.DataFrame(records, infer_schema_length=None).with_columns(
         pl.col("model").alias("generator"),
         pl.Series("label", labels_array),
         pl.Series("logit", logits_array),
