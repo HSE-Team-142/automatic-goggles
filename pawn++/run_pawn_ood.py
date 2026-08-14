@@ -8,7 +8,7 @@ import polars as pl
 import torch
 import torch.distributed as dist
 import yaml
-from datasets import concatenate_datasets, load_dataset
+from datasets import load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -27,6 +27,8 @@ DEFAULT_CHECKPOINT = (
     "checkpoint-39884/pytorch_model.bin"
 )
 DEFAULT_RAID_SPLITS = ["train", "extra"]
+RAID_DATA_URL = "https://dataset.raid-bench.xyz"
+LABELED_RAID_SPLITS = {"train", "extra"}
 
 
 def default_device() -> str:
@@ -109,17 +111,37 @@ class RAIDTextDataset(torch.utils.data.Dataset):
         return row["generation"], int(row["model"] != "human")
 
 
-def load_raid_dataset(splits: list[str]) -> RAIDTextDataset:
-    raid = load_dataset("liamdugan/raid")
-    unavailable_splits = set(splits) - set(raid)
-    if unavailable_splits:
-        raise ValueError(f"RAID splits are unavailable: {sorted(unavailable_splits)}")
-    return RAIDTextDataset(concatenate_datasets([raid[split] for split in splits]))
+def load_raid_datasets(splits: list[str]) -> dict[str, RAIDTextDataset]:
+    unsupported_splits = set(splits) - LABELED_RAID_SPLITS
+    if unsupported_splits:
+        raise ValueError(
+            "RAID OOD evaluation requires labeled splits. "
+            f"Choose from {sorted(LABELED_RAID_SPLITS)}, not {sorted(unsupported_splits)}."
+        )
+
+    # RAID publishes these smaller, clean partitions specifically for evaluations
+    # that do not include adversarial attacks.
+    raid = load_dataset(
+        "csv",
+        data_files={split: f"{RAID_DATA_URL}/{split}_none.csv" for split in splits},
+    )
+    datasets = {}
+    required_columns = {"generation", "model"}
+    for split in splits:
+        data = raid[split]
+        missing_columns = required_columns - set(data.column_names)
+        if missing_columns:
+            raise ValueError(
+                f"RAID {split!r} split is missing required columns: {sorted(missing_columns)}"
+            )
+        datasets[split] = RAIDTextDataset(data)
+    return datasets
 
 
 def evaluate_dataset(
     model: PAWN,
     dataset: RAIDTextDataset,
+    split: str,
     batch_size: int,
     output_dir: Path,
     rank: int,
@@ -139,7 +161,7 @@ def evaluate_dataset(
 
     model.eval()
     with torch.inference_mode():
-        for batch in tqdm(dataloader, desc=f"evaluate RAID (rank {rank})", disable=rank != 0):
+        for batch in tqdm(dataloader, desc=f"evaluate RAID {split} (rank {rank})", disable=rank != 0):
             labels = batch["labels"].cpu()
             logits = model(texts=batch["texts"]).detach().cpu()
             all_labels.append(labels)
@@ -161,7 +183,7 @@ def evaluate_dataset(
     metrics = compute_metrics(labels, logits)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = "raid"
+    stem = split
     with (output_dir / f"{stem}_metrics.json").open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2)
 
@@ -182,7 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path(DEFAULT_CONFIG))
     parser.add_argument("--checkpoint", type=Path, default=Path(DEFAULT_CHECKPOINT))
     parser.add_argument("--splits", nargs="+", default=DEFAULT_RAID_SPLITS, help="RAID splits to evaluate.")
-    parser.add_argument("--output_dir", type=Path, default=Path("raid_ood_eval"))
+    parser.add_argument("--output_dir", type=Path, default=Path("results"))
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
@@ -199,13 +221,25 @@ def main() -> None:
         model = PAWN(config.model).to(device)
         load_pawn_checkpoint(model, args.checkpoint)
 
-        dataset = load_raid_dataset(args.splits)
-        metrics = evaluate_dataset(model, dataset, batch_size, args.output_dir, rank, world_size)
-        if rank == 0:
-            all_metrics = {"raid": metrics}
-            print("\nRAID")
-            print(json.dumps(metrics, indent=2))
+        datasets = load_raid_datasets(args.splits)
+        all_metrics = {}
+        for split, dataset in datasets.items():
+            metrics = evaluate_dataset(
+                model=model,
+                dataset=dataset,
+                split=split,
+                batch_size=batch_size,
+                output_dir=args.output_dir,
+                rank=rank,
+                world_size=world_size,
+            )
+            if rank == 0:
+                all_metrics[split] = metrics
+                print(f"\nRAID {split}")
+                print(json.dumps(metrics, indent=2))
 
+        if rank == 0:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
             with (args.output_dir / "all_metrics.json").open("w", encoding="utf-8") as file:
                 json.dump(all_metrics, file, indent=2)
     finally:
