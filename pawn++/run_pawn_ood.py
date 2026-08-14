@@ -1,17 +1,20 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 import torch
+import torch.distributed as dist
 import yaml
+from datasets import concatenate_datasets, load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from configs import build_experiment_config
-from dataset_module import TextDataset, collate_text_batch
+from dataset_module import collate_text_batch
 from model import PAWN
 
 
@@ -23,10 +26,7 @@ DEFAULT_CHECKPOINT = (
     "mage_llama_instruct_llama_base_metrics_xppl_hs_uniform_agg_metrics_full/"
     "checkpoint-39884/pytorch_model.bin"
 )
-DEFAULT_DATASETS = [
-    "mage/testbeds/test_ood_gpt_para.csv",
-    "mage/testbeds/test_ood_gpt.csv",
-]
+DEFAULT_RAID_SPLITS = ["train", "extra"]
 
 
 def default_device() -> str:
@@ -35,6 +35,20 @@ def default_device() -> str:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def distributed_context() -> tuple[int, int, int]:
+    """Initialize torchrun's process group and return rank, local rank, world size."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return 0, 0, 1
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed OOD evaluation requires CUDA GPUs.")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return dist.get_rank(), local_rank, dist.get_world_size()
 
 
 def load_config(path: Path):
@@ -83,10 +97,38 @@ def compute_metrics(labels: np.ndarray, logits: np.ndarray) -> dict[str, float]:
     }
 
 
-def evaluate_dataset(model: PAWN, dataset_path: Path, batch_size: int, output_dir: Path) -> dict[str, float]:
-    dataset = TextDataset(str(dataset_path))
+class RAIDTextDataset(torch.utils.data.Dataset):
+    def __init__(self, data) -> None:
+        self.data = data
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index: int) -> tuple[str, int]:
+        row = self.data[index]
+        return row["generation"], int(row["model"] != "human")
+
+
+def load_raid_dataset(splits: list[str]) -> RAIDTextDataset:
+    raid = load_dataset("liamdugan/raid")
+    unavailable_splits = set(splits) - set(raid)
+    if unavailable_splits:
+        raise ValueError(f"RAID splits are unavailable: {sorted(unavailable_splits)}")
+    return RAIDTextDataset(concatenate_datasets([raid[split] for split in splits]))
+
+
+def evaluate_dataset(
+    model: PAWN,
+    dataset: RAIDTextDataset,
+    batch_size: int,
+    output_dir: Path,
+    rank: int,
+    world_size: int,
+) -> dict[str, float] | None:
+    # Unlike DistributedSampler, this does not pad the final shard with duplicate rows.
+    shard = Subset(dataset, range(rank, len(dataset), world_size))
     dataloader = DataLoader(
-        dataset,
+        shard,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_text_batch,
@@ -97,18 +139,29 @@ def evaluate_dataset(model: PAWN, dataset_path: Path, batch_size: int, output_di
 
     model.eval()
     with torch.inference_mode():
-        for batch in tqdm(dataloader, desc=f"evaluate {dataset_path.name}"):
+        for batch in tqdm(dataloader, desc=f"evaluate RAID (rank {rank})", disable=rank != 0):
             labels = batch["labels"].cpu()
             logits = model(texts=batch["texts"]).detach().cpu()
             all_labels.append(labels)
             all_logits.append(logits)
 
-    labels = torch.cat(all_labels).numpy().astype(int)
-    logits = torch.cat(all_logits).numpy().reshape(-1)
+    local_labels = torch.cat(all_labels).numpy().astype(int)
+    local_logits = torch.cat(all_logits).numpy().reshape(-1)
+
+    if world_size > 1:
+        gathered: list[tuple[np.ndarray, np.ndarray] | None] = [None] * world_size
+        dist.gather_object((local_labels, local_logits), gathered if rank == 0 else None, dst=0)
+        if rank != 0:
+            return None
+        labels = np.concatenate([item[0] for item in gathered if item is not None])
+        logits = np.concatenate([item[1] for item in gathered if item is not None])
+    else:
+        labels = local_labels
+        logits = local_logits
     metrics = compute_metrics(labels, logits)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = dataset_path.stem
+    stem = "raid"
     with (output_dir / f"{stem}_metrics.json").open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2)
 
@@ -125,11 +178,11 @@ def evaluate_dataset(model: PAWN, dataset_path: Path, batch_size: int, output_di
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate PAWN++ checkpoint on MAGE OOD GPT testbeds.")
+    parser = argparse.ArgumentParser(description="Evaluate PAWN++ checkpoint on the RAID OOD dataset.")
     parser.add_argument("--config", type=Path, default=Path(DEFAULT_CONFIG))
     parser.add_argument("--checkpoint", type=Path, default=Path(DEFAULT_CHECKPOINT))
-    parser.add_argument("--datasets", type=Path, nargs="+", default=[Path(path) for path in DEFAULT_DATASETS])
-    parser.add_argument("--output_dir", type=Path, default=Path("mage_ood_eval"))
+    parser.add_argument("--splits", nargs="+", default=DEFAULT_RAID_SPLITS, help="RAID splits to evaluate.")
+    parser.add_argument("--output_dir", type=Path, default=Path("raid_ood_eval"))
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
@@ -137,22 +190,27 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    device = args.device or default_device()
-    batch_size = args.batch_size or config.data.eval_batch_size
+    rank, local_rank, world_size = distributed_context()
+    try:
+        config = load_config(args.config)
+        device = f"cuda:{local_rank}" if world_size > 1 else args.device or default_device()
+        batch_size = args.batch_size or config.data.eval_batch_size
 
-    model = PAWN(config.model).to(device)
-    load_pawn_checkpoint(model, args.checkpoint)
+        model = PAWN(config.model).to(device)
+        load_pawn_checkpoint(model, args.checkpoint)
 
-    all_metrics = {}
-    for dataset_path in args.datasets:
-        metrics = evaluate_dataset(model, dataset_path, batch_size, args.output_dir)
-        all_metrics[str(dataset_path)] = metrics
-        print(f"\n{dataset_path}")
-        print(json.dumps(metrics, indent=2))
+        dataset = load_raid_dataset(args.splits)
+        metrics = evaluate_dataset(model, dataset, batch_size, args.output_dir, rank, world_size)
+        if rank == 0:
+            all_metrics = {"raid": metrics}
+            print("\nRAID")
+            print(json.dumps(metrics, indent=2))
 
-    with (args.output_dir / "all_metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(all_metrics, file, indent=2)
+            with (args.output_dir / "all_metrics.json").open("w", encoding="utf-8") as file:
+                json.dump(all_metrics, file, indent=2)
+    finally:
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -50,6 +50,10 @@ class PAWNTrainer(Trainer):
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
 
 
+def _running_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
 def compute_metrics(eval_pred):
       logits = np.asarray(eval_pred.predictions).reshape(-1)
       labels = np.asarray(eval_pred.label_ids).reshape(-1).astype(int)
@@ -110,6 +114,7 @@ def _get_training_args(args):
         # Training Stability
         max_grad_norm=optimizer_config.max_grad_norm,
         gradient_accumulation_steps=optimizer_config.gradient_accumulation_steps,
+        ddp_find_unused_parameters=False if _running_distributed() else None,
 
         # Scheduler
         lr_scheduler_type="cosine",
@@ -173,15 +178,13 @@ def main() -> None:
     model_config = config.model
     optimizer_config = config.optimizer
 
-    device = _default_device()
-
     train_dataset = TextDataset(args.train_dataset)
 
     eval_dataset = TextDataset(args.valid_dataset)
 
     test_dataset = TextDataset(args.test_dataset)
 
-    model = PAWN(model_config).to(device)
+    model = PAWN(model_config)
 
     training_args = _get_training_args(args)
 
@@ -208,8 +211,10 @@ def main() -> None:
 
     prediction_output = trainer.predict(test_dataset)
 
-    with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
-        json.dump(prediction_output.metrics, f, indent=2)
+    if trainer.is_world_process_zero():
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
+            json.dump(prediction_output.metrics, f, indent=2)
 
 
 if __name__ == "__main__":

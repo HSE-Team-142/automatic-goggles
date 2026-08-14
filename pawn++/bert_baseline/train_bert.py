@@ -24,6 +24,14 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def _running_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def _is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
 class BertTextCollator:
     def __init__(self, tokenizer, max_length: int):
         self.tokenizer = tokenizer
@@ -135,6 +143,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, args):
 
         # Training Stability
         max_grad_norm=args.max_grad_norm,
+        ddp_find_unused_parameters=False if _running_distributed() else None,
 
         # Evaluation and logging
         eval_strategy="epoch",
@@ -166,11 +175,13 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, args):
         pos_weight=args.pos_weight,
     )
 
-    print("Starting training...")
+    if _is_main_process():
+        print("Starting training...")
     train_result = trainer.train()
 
-    print("\nTraining completed!")
-    print(f"Training metrics: {train_result.metrics}")
+    if trainer.is_world_process_zero():
+        print("\nTraining completed!")
+        print(f"Training metrics: {train_result.metrics}")
 
     return trainer
 
@@ -277,24 +288,27 @@ def main():
 
     set_seed(args.seed)
 
-    device = _default_device()
-    print(f"Using device: {device}")
+    if _is_main_process():
+        print(f"Using device: {_default_device()}")
 
-    print(f"Loading tokenizer from {args.base_model}...")
+    if _is_main_process():
+        print(f"Loading tokenizer from {args.base_model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
-    print(f"Loading model from {args.base_model}...")
+    if _is_main_process():
+        print(f"Loading model from {args.base_model}...")
     model = AutoModelForSequenceClassification.from_pretrained(
         args.base_model,
         num_labels=2,
     )
-    model.to(device)
 
-    print("Loading CSV datasets...")
+    if _is_main_process():
+        print("Loading CSV datasets...")
     train_dataset = TextDataset(args.train_dataset)
     eval_dataset = TextDataset(args.valid_dataset)
     test_dataset = TextDataset(args.test_dataset)
-    print(f"Train size: {len(train_dataset)}, Validation size: {len(eval_dataset)}, Test size: {len(test_dataset)}")
+    if _is_main_process():
+        print(f"Train size: {len(train_dataset)}, Validation size: {len(eval_dataset)}, Test size: {len(test_dataset)}")
 
     if args.report_to == "mlflow":
         import mlflow
@@ -305,21 +319,25 @@ def main():
         model, tokenizer, train_dataset, eval_dataset, args
     )
 
-    print("\nEvaluating model...")
+    if trainer.is_world_process_zero():
+        print("\nEvaluating model...")
     eval_results = trainer.evaluate(eval_dataset)
-    print(f"Evaluation results: {eval_results}")
+    if trainer.is_world_process_zero():
+        print(f"Evaluation results: {eval_results}")
 
-    print("\nPredicting test dataset...")
+    if trainer.is_world_process_zero():
+        print("\nPredicting test dataset...")
     prediction_output = trainer.predict(test_dataset)
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
-        json.dump(prediction_output.metrics, f, indent=2)
+    if trainer.is_world_process_zero():
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
+            json.dump(prediction_output.metrics, f, indent=2)
 
-    print(f"\nSaving model to {args.output_dir}...")
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+        print(f"\nSaving model to {args.output_dir}...")
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
 
-    print("\nTraining pipeline completed successfully!")
+        print("\nTraining pipeline completed successfully!")
 
 
 if __name__ == "__main__":
